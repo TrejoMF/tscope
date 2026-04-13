@@ -1,4 +1,4 @@
-# TermiUS
+# TScope
 
 A terminal multiplexer with context-aware side panels. Splits the screen into
 side-by-side shell panes and, for the focused pane, shows live information
