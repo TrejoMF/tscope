@@ -1,0 +1,416 @@
+use alacritty_terminal::event::VoidListener;
+use alacritty_terminal::grid::{Dimensions, Scroll};
+use alacritty_terminal::index::{Column, Line as GridLine};
+use alacritty_terminal::term::test::TermSize;
+use alacritty_terminal::term::Config as TermConfig;
+use alacritty_terminal::vte::ansi::Processor;
+use alacritty_terminal::Term;
+use anyhow::Result;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use portable_pty::{CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
+use std::io::{Read, Write};
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant};
+
+use std::path::PathBuf;
+
+use crate::claude::{self, ClaudeContext};
+use crate::config::{Config, PaneSettings};
+use crate::process::{self, ProcessInfo};
+use crate::service::{self, ServiceContext};
+use crate::ssh::SshContext;
+
+const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(500);
+/// How often we shell out to `lsof` to (re)discover listening services.
+/// Resource sampling for a known service runs on the normal 500ms cadence.
+const SERVICE_DISCOVERY_INTERVAL: Duration = Duration::from_secs(2);
+
+pub struct Pane {
+    pub term: Term<VoidListener>,
+    processor: Processor,
+    writer: Box<dyn Write + Send>,
+    rx: mpsc::Receiver<Vec<u8>>,
+    master: Box<dyn MasterPty + Send>,
+    pub cols: u16,
+    pub rows: u16,
+    pub proc_info: Option<ProcessInfo>,
+    last_poll: Instant,
+    pub claude: Option<ClaudeContext>,
+    pub ssh: Option<SshContext>,
+    pub service: Option<ServiceContext>,
+    last_service_discovery: Instant,
+    /// Accumulates printable chars typed since the last Enter, so we can
+    /// surface them as the "last command" for ssh sessions.
+    typing_buffer: String,
+    pub last_typed: Option<String>,
+    /// Cwd captured when the pane spawned — used as the persistence key
+    /// for per-pane settings (name, accent color).
+    pub initial_cwd: Option<PathBuf>,
+    pub settings: PaneSettings,
+}
+
+impl Pane {
+    pub fn spawn_shell(cols: u16, rows: u16, config: &Config) -> Result<Self> {
+        let pty_system = NativePtySystem::default();
+        let pair = pty_system.openpty(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })?;
+
+        // Use new_default_prog so portable-pty launches $SHELL as a proper
+        // login shell (argv[0] = "-zsh"). Required by many shell plugins.
+        let mut cmd = CommandBuilder::new_default_prog();
+        let initial_cwd = std::env::current_dir().ok();
+        if let Some(ref cwd) = initial_cwd {
+            cmd.cwd(cwd);
+        }
+        cmd.env("TERM", "xterm-256color");
+        let settings = initial_cwd
+            .as_ref()
+            .map(|cwd| config.lookup_pane_settings(cwd))
+            .unwrap_or_default();
+        let _child = pair.slave.spawn_command(cmd)?;
+        drop(pair.slave);
+
+        let mut reader = pair.master.try_clone_reader()?;
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) => break,
+                    Err(_) => break,
+                    Ok(n) => {
+                        if tx.send(buf[..n].to_vec()).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
+        let writer = pair.master.take_writer()?;
+
+        let size = TermSize::new(cols as usize, rows as usize);
+        let term = Term::new(TermConfig::default(), &size, VoidListener);
+        let processor = Processor::new();
+
+        Ok(Self {
+            term,
+            processor,
+            writer,
+            rx,
+            master: pair.master,
+            cols,
+            rows,
+            proc_info: None,
+            last_poll: Instant::now()
+                .checked_sub(PROCESS_POLL_INTERVAL)
+                .unwrap_or_else(Instant::now),
+            claude: None,
+            ssh: None,
+            service: None,
+            last_service_discovery: Instant::now()
+                .checked_sub(SERVICE_DISCOVERY_INTERVAL)
+                .unwrap_or_else(Instant::now),
+            typing_buffer: String::new(),
+            last_typed: None,
+            initial_cwd,
+            settings,
+        })
+    }
+
+    /// Refresh foreground process info (throttled to PROCESS_POLL_INTERVAL).
+    /// Also (re)attaches a Claude Code session tailer when the foreground
+    /// process is `claude`, and an SSH context when it's `ssh`.
+    pub fn poll_process_info(&mut self, config: &Config) {
+        if self.last_poll.elapsed() < PROCESS_POLL_INTERVAL {
+            return;
+        }
+        self.last_poll = Instant::now();
+        if let Some(pgid) = self.master.process_group_leader() {
+            self.proc_info = process::inspect(pgid);
+        }
+        self.sync_claude();
+        self.sync_ssh(config);
+        self.sync_service();
+    }
+
+    fn sync_service(&mut self) {
+        // Claude / SSH panes own the panel when present; skip service detection.
+        if self.claude.is_some() || self.ssh.is_some() {
+            self.service = None;
+            return;
+        }
+
+        let Some(pgid) = self.master.process_group_leader() else {
+            self.service = None;
+            return;
+        };
+
+        // Re-discover listening services only on the slower cadence (lsof is
+        // cheap but not free). In between, just refresh resources on the
+        // existing service context.
+        let should_rediscover = self.last_service_discovery.elapsed() >= SERVICE_DISCOVERY_INTERVAL;
+
+        if should_rediscover {
+            self.last_service_discovery = Instant::now();
+            match service::detect_service(pgid) {
+                Some((pid, cmd_from_lsof, ports)) => {
+                    let keep_existing = matches!(&self.service, Some(s) if s.pid == pid);
+                    if keep_existing {
+                        if let Some(existing) = self.service.as_mut() {
+                            existing.ports = ports;
+                        }
+                    } else {
+                        let info = process::inspect(pid);
+                        let name = info
+                            .as_ref()
+                            .map(|i| i.name.clone())
+                            .unwrap_or_else(|| cmd_from_lsof.clone());
+                        let command = info
+                            .as_ref()
+                            .filter(|i| !i.argv.is_empty())
+                            .map(|i| i.argv.join(" "))
+                            .unwrap_or_else(|| cmd_from_lsof.clone());
+                        let started_at = info
+                            .as_ref()
+                            .and_then(|i| i.start_time)
+                            .unwrap_or_else(std::time::SystemTime::now);
+                        self.service =
+                            Some(ServiceContext::new(pid, name, command, ports, started_at));
+                    }
+                }
+                None => {
+                    self.service = None;
+                }
+            }
+        }
+
+        if let Some(svc) = self.service.as_mut() {
+            svc.sample_resources();
+        }
+    }
+
+    fn sync_ssh(&mut self, config: &Config) {
+        let info = match &self.proc_info {
+            Some(i) if i.is_ssh() => i,
+            _ => {
+                self.ssh = None;
+                return;
+            }
+        };
+        // Keep the existing context if it's still for the same ssh invocation
+        // (same start_time = same process). Rebuilding would wipe the async
+        // DNS result and the started_at.
+        if let Some(existing) = &self.ssh {
+            if existing.started_at == info.start_time.unwrap_or(existing.started_at) {
+                return;
+            }
+        }
+        self.ssh = SshContext::try_from_proc(info, config);
+    }
+
+    fn sync_claude(&mut self) {
+        let is_claude = self
+            .proc_info
+            .as_ref()
+            .map(|p| p.is_claude_code())
+            .unwrap_or(false);
+        if !is_claude {
+            self.claude = None;
+            return;
+        }
+        let Some(cwd) = self.proc_info.as_ref().and_then(|p| p.cwd.clone()) else {
+            self.claude = None;
+            return;
+        };
+        if let Some(ctx) = &self.claude {
+            if ctx.session_cwd == cwd {
+                return;
+            }
+        }
+        let Some(home) = dirs::home_dir() else { return };
+        if let Some(path) = claude::find_session(&home, &cwd) {
+            self.claude = Some(ClaudeContext::new(path, cwd));
+        }
+    }
+
+    /// Tail the attached Claude session file (if any).
+    pub fn tick_claude(&mut self) {
+        if let Some(ctx) = &mut self.claude {
+            let _ = ctx.tick();
+        }
+    }
+
+    /// Pull any available PTY output and feed it into the VT emulator.
+    pub fn drain(&mut self) {
+        while let Ok(chunk) = self.rx.try_recv() {
+            self.processor.advance(&mut self.term, &chunk);
+        }
+    }
+
+    pub fn send_key(&mut self, key: KeyEvent) -> Result<()> {
+        self.track_typing(&key);
+        let bytes = key_to_bytes(key);
+        if !bytes.is_empty() {
+            self.writer.write_all(&bytes)?;
+            self.writer.flush()?;
+        }
+        Ok(())
+    }
+
+    /// Update `typing_buffer` / `last_typed` to surface the last line the
+    /// user submitted. Best-effort: full-screen TUIs (vim, htop) will pollute
+    /// the buffer with navigation keystrokes, but for shell-like sessions
+    /// (what SSH usually is) this captures the last command.
+    fn track_typing(&mut self, key: &KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Enter => {
+                let text = self.typing_buffer.trim();
+                if !text.is_empty() {
+                    self.last_typed = Some(text.to_string());
+                }
+                self.typing_buffer.clear();
+            }
+            KeyCode::Backspace => {
+                self.typing_buffer.pop();
+            }
+            KeyCode::Char('c') | KeyCode::Char('u') | KeyCode::Char('d')
+                if ctrl =>
+            {
+                self.typing_buffer.clear();
+            }
+            KeyCode::Char(c) if !ctrl => {
+                self.typing_buffer.push(c);
+            }
+            _ => {}
+        }
+    }
+
+    /// Scroll the viewport. Positive delta = into history (up), negative = back
+    /// toward the live edge (down).
+    pub fn scroll(&mut self, delta: i32) {
+        self.term.scroll_display(Scroll::Delta(delta));
+    }
+
+    pub fn scroll_to_bottom(&mut self) {
+        self.term.scroll_display(Scroll::Bottom);
+    }
+
+    /// Extract text between two viewport-relative points, inclusive. Rows are
+    /// 0..screen_lines, cols are 0..columns. Trailing spaces are trimmed from
+    /// every line except the last.
+    pub fn extract_text(&self, start: (usize, usize), end: (usize, usize)) -> String {
+        let (start, end) = order_points(start, end);
+        let grid = self.term.grid();
+        let rows = grid.screen_lines();
+        let cols = grid.columns();
+        if rows == 0 || cols == 0 {
+            return String::new();
+        }
+        let last_row = rows - 1;
+        let last_col = cols - 1;
+
+        let mut out = String::new();
+        for row in start.0..=end.0.min(last_row) {
+            let col_lo = if row == start.0 { start.1 } else { 0 };
+            let col_hi = if row == end.0 { end.1.min(last_col) } else { last_col };
+            let mut line = String::new();
+            for col in col_lo..=col_hi {
+                let cell = &grid[GridLine(row as i32)][Column(col)];
+                let c = cell.c;
+                line.push(if c == '\0' { ' ' } else { c });
+            }
+            if row == end.0 {
+                out.push_str(&line);
+            } else {
+                out.push_str(line.trim_end_matches(' '));
+                out.push('\n');
+            }
+        }
+        out
+    }
+
+    pub fn resize(&mut self, cols: u16, rows: u16) -> Result<()> {
+        if cols == self.cols && rows == self.rows {
+            return Ok(());
+        }
+        self.master.resize(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })?;
+        self.term.resize(TermSize::new(cols as usize, rows as usize));
+        self.cols = cols;
+        self.rows = rows;
+        Ok(())
+    }
+}
+
+fn order_points(a: (usize, usize), b: (usize, usize)) -> ((usize, usize), (usize, usize)) {
+    if a <= b { (a, b) } else { (b, a) }
+}
+
+fn key_to_bytes(key: KeyEvent) -> Vec<u8> {
+    use KeyCode::*;
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    let mut out = Vec::new();
+    if alt {
+        out.push(0x1b);
+    }
+    match key.code {
+        Char(c) => {
+            if ctrl && c.is_ascii_alphabetic() {
+                let b = (c.to_ascii_lowercase() as u8).wrapping_sub(b'a').wrapping_add(1);
+                out.push(b);
+            } else if ctrl && c == ' ' {
+                out.push(0);
+            } else {
+                let mut buf = [0u8; 4];
+                out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+            }
+        }
+        Enter => out.push(b'\r'),
+        Backspace => out.push(0x7f),
+        Esc => out.push(0x1b),
+        Tab => out.push(b'\t'),
+        BackTab => out.extend_from_slice(b"\x1b[Z"),
+        Left => out.extend_from_slice(b"\x1b[D"),
+        Right => out.extend_from_slice(b"\x1b[C"),
+        Up => out.extend_from_slice(b"\x1b[A"),
+        Down => out.extend_from_slice(b"\x1b[B"),
+        Home => out.extend_from_slice(b"\x1b[H"),
+        End => out.extend_from_slice(b"\x1b[F"),
+        PageUp => out.extend_from_slice(b"\x1b[5~"),
+        PageDown => out.extend_from_slice(b"\x1b[6~"),
+        Delete => out.extend_from_slice(b"\x1b[3~"),
+        Insert => out.extend_from_slice(b"\x1b[2~"),
+        F(n) => {
+            let seq: &[u8] = match n {
+                1 => b"\x1bOP",
+                2 => b"\x1bOQ",
+                3 => b"\x1bOR",
+                4 => b"\x1bOS",
+                5 => b"\x1b[15~",
+                6 => b"\x1b[17~",
+                7 => b"\x1b[18~",
+                8 => b"\x1b[19~",
+                9 => b"\x1b[20~",
+                10 => b"\x1b[21~",
+                11 => b"\x1b[23~",
+                12 => b"\x1b[24~",
+                _ => b"",
+            };
+            out.extend_from_slice(seq);
+        }
+        _ => {}
+    }
+    out
+}
