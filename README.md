@@ -104,12 +104,64 @@ color = "magenta"
 `ssh_aliases` is keyed by `user@host` (or just `host`) and used to label
 SSH panes. `pane_aliases` is keyed by absolute working directory.
 
-## Build & run
+## Installation
+
+### Prebuilt binaries (recommended)
+
+Releases are built for macOS (Apple Silicon + Intel), Linux (x86_64 +
+aarch64), and Windows (x86_64).
+
+**macOS / Linux:**
+
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/TrejoMF/tscope/releases/latest/download/t-scope-installer.sh | sh
+```
+
+**Windows (PowerShell):**
+
+```powershell
+powershell -ExecutionPolicy ByPass -c "irm https://github.com/TrejoMF/tscope/releases/latest/download/t-scope-installer.ps1 | iex"
+```
+
+Both installers drop the `t-scope` binary into a directory on your `PATH`
+(e.g. `~/.local/bin` on Unix). Pin a specific version by replacing
+`latest/download` with `download/vX.Y.Z`.
+
+### From crates.io
+
+```sh
+cargo install t-scope
+```
+
+### From source
+
+```sh
+git clone https://github.com/TrejoMF/tscope.git
+cd tscope
+cargo install --path .
+```
+
+Or without cloning:
+
+```sh
+cargo install --git https://github.com/TrejoMF/tscope.git
+```
+
+## Run
+
+After install:
+
+```sh
+t-scope
+```
+
+Or from a checkout:
 
 ```sh
 cargo run --release
 ```
 
-Requires Rust 2024 edition. Service detection (port/CPU/memory) is
+Building from source requires Rust 2024 edition (install via
+[rustup](https://rustup.rs)). Service detection (port/CPU/memory) is
 macOS-only — other platforms still get the multiplexer, SSH context, and
 Claude context.

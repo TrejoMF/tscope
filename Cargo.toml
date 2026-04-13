@@ -21,6 +21,7 @@ notify = "7"
 anyhow = "1"
 dirs = "5"
 libc = "0.2"
+arboard = "3"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libproc = "0.14"

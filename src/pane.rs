@@ -302,36 +302,45 @@ impl Pane {
         self.term.scroll_display(Scroll::Bottom);
     }
 
-    /// Extract text between two viewport-relative points, inclusive. Rows are
-    /// 0..screen_lines, cols are 0..columns. Trailing spaces are trimmed from
-    /// every line except the last.
-    pub fn extract_text(&self, start: (usize, usize), end: (usize, usize)) -> String {
+    /// Extract text between two absolute grid points, inclusive. `line`
+    /// follows alacritty's convention: `0..screen_lines` is the live viewport
+    /// and negative values address scrollback. Trailing spaces are trimmed
+    /// from every line except the last.
+    pub fn extract_text(&self, start: (i32, usize), end: (i32, usize)) -> String {
         let (start, end) = order_points(start, end);
         let grid = self.term.grid();
-        let rows = grid.screen_lines();
+        let rows = grid.screen_lines() as i32;
         let cols = grid.columns();
         if rows == 0 || cols == 0 {
             return String::new();
         }
-        let last_row = rows - 1;
         let last_col = cols - 1;
+        let top_line = -(grid.history_size() as i32);
+        let bottom_line = rows - 1;
+        let lo = start.0.max(top_line);
+        let hi = end.0.min(bottom_line);
+        if lo > hi {
+            return String::new();
+        }
 
         let mut out = String::new();
-        for row in start.0..=end.0.min(last_row) {
-            let col_lo = if row == start.0 { start.1 } else { 0 };
-            let col_hi = if row == end.0 { end.1.min(last_col) } else { last_col };
-            let mut line = String::new();
+        let mut line = lo;
+        while line <= hi {
+            let col_lo = if line == start.0 { start.1 } else { 0 };
+            let col_hi = if line == end.0 { end.1.min(last_col) } else { last_col };
+            let mut buf = String::new();
             for col in col_lo..=col_hi {
-                let cell = &grid[GridLine(row as i32)][Column(col)];
+                let cell = &grid[GridLine(line)][Column(col)];
                 let c = cell.c;
-                line.push(if c == '\0' { ' ' } else { c });
+                buf.push(if c == '\0' { ' ' } else { c });
             }
-            if row == end.0 {
-                out.push_str(&line);
+            if line == hi {
+                out.push_str(&buf);
             } else {
-                out.push_str(line.trim_end_matches(' '));
+                out.push_str(buf.trim_end_matches(' '));
                 out.push('\n');
             }
+            line += 1;
         }
         out
     }
@@ -353,7 +362,7 @@ impl Pane {
     }
 }
 
-fn order_points(a: (usize, usize), b: (usize, usize)) -> ((usize, usize), (usize, usize)) {
+fn order_points(a: (i32, usize), b: (i32, usize)) -> ((i32, usize), (i32, usize)) {
     if a <= b { (a, b) } else { (b, a) }
 }
 

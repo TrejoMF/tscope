@@ -5,7 +5,7 @@ use alacritty_terminal::vte::ansi::{Color as AlacColor, NamedColor};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph, Wrap};
 
-use crate::app::{App, CopyState, InputMode, SettingsField, SettingsState};
+use crate::app::{App, CopyState, InputMode, PanePickerState, SettingsField, SettingsState};
 use crate::pane::Pane;
 use crate::theme;
 
@@ -26,22 +26,24 @@ pub fn draw(f: &mut Frame, app: &App) {
         (chunks[0], None, chunks[1])
     };
 
-    // Horizontal split: one column per pane, using the same widths the app
-    // already resized the PTYs to. Keeping both in sync avoids a mismatched
-    // VT grid vs visible area.
+    // Horizontal split: one column per *visible* pane. Panes beyond the
+    // visible window stay alive (PTY keeps draining) but aren't drawn or
+    // resized — they'll be resized the next time they slide into view.
     let widths = app.pane_widths();
-    if !widths.is_empty() {
+    let visible = app.visible_panes();
+    if !widths.is_empty() && !visible.is_empty() {
         let constraints: Vec<Constraint> =
             widths.iter().map(|w| Constraint::Length(*w)).collect();
         let pane_rects = Layout::horizontal(constraints).split(pane_area);
-        for (i, pane) in app.panes.iter().enumerate() {
-            let rect = pane_rects[i];
-            let copy = if i == app.focus {
+        for (slot, &pane_idx) in visible.iter().enumerate() {
+            let Some(pane) = app.panes.get(pane_idx) else { continue };
+            let rect = pane_rects[slot];
+            let copy = if pane_idx == app.focus {
                 if let InputMode::Copy(state) = &app.mode { Some(state) } else { None }
             } else {
                 None
             };
-            render_pane(f, pane, rect, i, i == app.focus, copy);
+            render_pane(f, pane, rect, pane_idx, pane_idx == app.focus, copy);
         }
     }
 
@@ -54,6 +56,9 @@ pub fn draw(f: &mut Frame, app: &App) {
     // Modal overlay drawn last so it sits above everything.
     if let InputMode::Settings(state) = &app.mode {
         render_settings_modal(f, app, state, area);
+    }
+    if let InputMode::PanePicker(state) = &app.mode {
+        render_pane_picker_modal(f, app, state, area);
     }
 }
 
@@ -93,10 +98,11 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
         InputMode::Rename { .. } => "RENAME",
         InputMode::Settings(_) => "SETTINGS",
         InputMode::Copy(_) => "COPY",
+        InputMode::PanePicker(_) => "PANES",
     };
     let help_owned = match &app.mode {
         InputMode::Prefix => {
-            "n=new x=close h/l=switch 1-9=jump r=rename-ssh s=settings [=copy q=quit a=literal"
+            "n=new x=close h/l=switch 1-9=jump p=panes r=rename-ssh s=settings [=copy q=quit a=literal"
                 .to_string()
         }
         InputMode::Copy(state) => {
@@ -106,7 +112,10 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
                 "hjkl/arrows=move 0/$=line g/G=top/bot v=select y/Enter=yank Esc=exit".to_string()
             }
         }
-        _ => "Ctrl-a: n=new x=close h/l=switch 1-9=jump r=rename-ssh s=settings [=copy q=quit"
+        InputMode::PanePicker(_) => {
+            "↑/↓=move 1-9=quick-select Enter=show Esc=cancel".to_string()
+        }
+        _ => "Ctrl-a: n=new x=close h/l=switch 1-9=jump p=panes r=rename-ssh s=settings [=copy q=quit"
             .to_string(),
     };
     let style = if matches!(app.mode, InputMode::Copy(_)) {
@@ -114,14 +123,35 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
     } else {
         Style::default().bg(Color::DarkGray).fg(Color::White)
     };
-    let status = Paragraph::new(format!(
-        " t-scope  |  panes: {}  |  focus: {}  |  {}  |  {} ",
-        app.panes.len(),
+
+    // Compose the status as styled spans so the overflow indicator can stand
+    // out visually when the user has more panes than visible slots.
+    let total = app.panes.len();
+    let visible_count = app.visible_panes().len();
+    let hidden = total.saturating_sub(visible_count);
+
+    let mut spans: Vec<Span<'static>> = vec![
+        Span::raw(" t-scope  |  "),
+        Span::raw(format!("panes: {}/{}", visible_count, total)),
+    ];
+    if hidden > 0 {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            format!(" ⋯ +{} hidden (Ctrl-a p) ", hidden),
+            Style::default()
+                .bg(Color::Yellow)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    spans.push(Span::raw(format!(
+        "  |  focus: {}  |  {}  |  {} ",
         app.focus + 1,
         mode_label,
         help_owned,
-    ))
-    .style(style);
+    )));
+
+    let status = Paragraph::new(Line::from(spans)).style(style);
     f.render_widget(status, area);
 }
 
@@ -160,13 +190,18 @@ fn render_pane(
     let total_cols = grid.columns();
     let render_rows = (body_area.height as usize).min(total_rows);
     let render_cols = (body_area.width as usize).min(total_cols);
+    // Viewport row r maps to absolute grid line `r - display_offset`. Without
+    // this shift, `grid[Line(r)]` always returns the live viewport regardless
+    // of scroll position.
+    let display_offset = grid.display_offset() as i32;
 
     let selection_style = Style::default().bg(Color::Rgb(0x44, 0x3a, 0x78)).fg(Color::White);
     let cursor_style = Style::default().bg(Color::Yellow).fg(Color::Black);
 
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(render_rows);
     for row in 0..render_rows {
-        let line_idx = GridLine(row as i32);
+        let abs_line = row as i32 - display_offset;
+        let line_idx = GridLine(abs_line);
         let mut spans: Vec<Span<'static>> = Vec::new();
         let mut buf = String::new();
         let mut current_style = Style::default();
@@ -174,10 +209,10 @@ fn render_pane(
             let cell = &grid[line_idx][Column(col)];
             let mut style = cell_to_style(cell.fg, cell.bg, cell.flags);
             if let Some(cs) = copy {
-                if cs.is_selected(row, col) {
+                if cs.is_selected(abs_line, col) {
                     style = selection_style;
                 }
-                if cs.cursor == (row, col) {
+                if cs.cursor == (abs_line, col) {
                     style = cursor_style;
                 }
             }
@@ -862,6 +897,155 @@ fn render_settings_modal(f: &mut Frame, app: &App, state: &SettingsState, area: 
         Span::styled(" cancel", Style::default().fg(Color::DarkGray)),
     ]);
     f.render_widget(Paragraph::new(footer), chunks[7]);
+}
+
+fn render_pane_picker_modal(f: &mut Frame, app: &App, state: &PanePickerState, area: Rect) {
+    let row_count = app.panes.len().max(1) as u16;
+    let desired_h = (row_count + 6).min(area.height.saturating_sub(2));
+    let width = 72u16.min(area.width.saturating_sub(4));
+    let height = desired_h.max(8);
+    let rect = center_rect(width, height, area);
+
+    f.render_widget(Clear, rect);
+
+    let visible_count = app.visible_panes().len();
+    let total = app.panes.len();
+    let title = Line::from(vec![
+        Span::raw(" "),
+        Span::styled(
+            "▦ Panes",
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+        dim_sep(),
+        Span::raw(" "),
+        Span::styled(
+            format!("showing {} of {}", visible_count, total),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::raw(" "),
+    ]);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Magenta))
+        .title(title)
+        .title_alignment(Alignment::Left)
+        .padding(Padding::new(2, 2, 1, 1));
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+
+    let chunks = Layout::vertical([
+        Constraint::Length(1), // subtitle
+        Constraint::Length(1), // spacer
+        Constraint::Min(1),    // pane list
+        Constraint::Length(1), // spacer
+        Constraint::Length(1), // footer
+    ])
+    .split(inner);
+
+    let subtitle = Line::from(vec![
+        Span::styled(
+            "Pick a pane to place it in the leftmost slot.",
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]);
+    f.render_widget(Paragraph::new(subtitle), chunks[0]);
+
+    let visible_set: std::collections::HashSet<usize> =
+        app.visible_panes().into_iter().collect();
+
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(app.panes.len());
+    for (i, pane) in app.panes.iter().enumerate() {
+        let selected = i == state.cursor;
+        let is_primary = app.has_overflow() && i == app.primary;
+        let is_visible = visible_set.contains(&i);
+
+        let accent = pane
+            .settings
+            .color
+            .as_deref()
+            .and_then(theme::color_from_name)
+            .unwrap_or(Color::Blue);
+
+        let name = pane
+            .settings
+            .name
+            .clone()
+            .unwrap_or_else(|| format!("pane {}", i + 1));
+        let cmd = pane
+            .proc_info
+            .as_ref()
+            .map(|p| p.display_name().to_string())
+            .unwrap_or_else(|| "…".to_string());
+
+        let cursor_marker = if selected { "▶ " } else { "  " };
+        let visibility_marker = if is_primary {
+            "★"
+        } else if is_visible {
+            "●"
+        } else {
+            "·"
+        };
+        let visibility_style = if is_primary {
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        } else if is_visible {
+            Style::default().fg(Color::Green)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+
+        let row_style = if selected {
+            Style::default()
+                .bg(Color::Rgb(0x44, 0x3a, 0x78))
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+
+        let spans = vec![
+            Span::styled(
+                cursor_marker,
+                if selected {
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                },
+            ),
+            Span::styled(format!("{} ", i + 1), Style::default().fg(Color::DarkGray)),
+            Span::styled(visibility_marker, visibility_style),
+            Span::raw(" "),
+            Span::styled("  ", Style::default().bg(accent)),
+            Span::raw(" "),
+            Span::styled(
+                name,
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  ·  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(cmd, Style::default().fg(Color::Cyan)),
+        ];
+        lines.push(Line::from(spans).style(row_style));
+    }
+
+    f.render_widget(Paragraph::new(lines), chunks[2]);
+
+    let footer = Line::from(vec![
+        Span::styled("↑/↓", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Span::styled(" move · ", Style::default().fg(Color::DarkGray)),
+        Span::styled("1-9", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Span::styled(" quick-select · ", Style::default().fg(Color::DarkGray)),
+        Span::styled("Enter", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+        Span::styled(" show · ", Style::default().fg(Color::DarkGray)),
+        Span::styled("Esc", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+        Span::styled(" cancel", Style::default().fg(Color::DarkGray)),
+    ]);
+    f.render_widget(Paragraph::new(footer), chunks[4]);
 }
 
 fn center_rect(width: u16, height: u16, area: Rect) -> Rect {

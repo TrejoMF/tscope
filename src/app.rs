@@ -1,3 +1,4 @@
+use alacritty_terminal::grid::Dimensions;
 use anyhow::Result;
 use crossterm::event::{
     Event, EventStream, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind,
@@ -15,6 +16,11 @@ use crate::ui;
 
 pub const CONTEXT_PANEL_ROWS: u16 = 10;
 
+/// Maximum panes rendered side-by-side. Beyond this, extra panes stay alive
+/// (draining PTY output) but are hidden until brought into the visible window
+/// via the pane picker (`Ctrl-a p`) or focus navigation.
+pub const VISIBLE_SLOTS: usize = 3;
+
 pub enum InputMode {
     Normal,
     Prefix,
@@ -24,35 +30,50 @@ pub enum InputMode {
     /// Per-pane selection mode. Keyboard-driven cursor + anchor; yanks to the
     /// host terminal's clipboard via OSC 52.
     Copy(CopyState),
+    /// Modal list of all panes; pick one to become the primary (leftmost)
+    /// of the visible 3-slot window.
+    PanePicker(PanePickerState),
+}
+
+#[derive(Debug)]
+pub struct PanePickerState {
+    pub cursor: usize,
 }
 
 #[derive(Debug, Clone)]
 pub struct CopyState {
-    /// Cursor position in viewport coordinates (row, col).
-    pub cursor: (usize, usize),
-    /// Selection anchor; `None` means no selection has been started yet.
-    pub anchor: Option<(usize, usize)>,
+    /// Cursor in absolute grid coordinates. `line` follows alacritty's
+    /// convention: `0..screen_lines` is the live viewport, negative values
+    /// index into scrollback (so `-1` is the row just above the live top).
+    pub cursor: (i32, usize),
+    /// Selection anchor in the same coordinate space; `None` means no
+    /// selection has been started yet.
+    pub anchor: Option<(i32, usize)>,
     /// Transient status line message (e.g. "copied N bytes").
     pub notice: Option<String>,
 }
 
 impl CopyState {
-    pub fn new(rows: u16, _cols: u16) -> Self {
-        let row = rows.saturating_sub(1) as usize;
-        Self { cursor: (row, 0), anchor: None, notice: None }
+    /// Start the cursor at the bottom of whatever is currently visible, so
+    /// entering copy mode while scrolled into history doesn't yank you back.
+    pub fn new(rows: u16, display_offset: usize) -> Self {
+        let line = rows.saturating_sub(1) as i32 - display_offset as i32;
+        Self { cursor: (line, 0), anchor: None, notice: None }
     }
 
     /// Ordered (start, end) for the current selection, if any.
-    pub fn selection_bounds(&self) -> Option<((usize, usize), (usize, usize))> {
+    pub fn selection_bounds(&self) -> Option<((i32, usize), (i32, usize))> {
         let a = self.anchor?;
         let b = self.cursor;
         Some(if a <= b { (a, b) } else { (b, a) })
     }
 
-    /// Whether a given viewport cell falls inside the current selection.
-    pub fn is_selected(&self, row: usize, col: usize) -> bool {
+    /// Whether a given absolute (line, col) cell falls inside the current
+    /// selection. Callers translate viewport rows to absolute lines via
+    /// `absolute_line = viewport_row - display_offset`.
+    pub fn is_selected(&self, line: i32, col: usize) -> bool {
         let Some((s, e)) = self.selection_bounds() else { return false };
-        let p = (row, col);
+        let p = (line, col);
         p >= s && p <= e
     }
 }
@@ -95,6 +116,9 @@ impl SettingsState {
 pub struct App {
     pub panes: Vec<Pane>,
     pub focus: usize,
+    /// Pane index that occupies the leftmost visible slot when the total
+    /// pane count exceeds `VISIBLE_SLOTS`. Ignored otherwise.
+    pub primary: usize,
     pub quit: bool,
     pub mode: InputMode,
     pub screen: (u16, u16),
@@ -102,8 +126,42 @@ pub struct App {
 }
 
 impl App {
+    /// Absolute pane indices currently rendered, in left-to-right order.
+    /// When `panes.len() <= VISIBLE_SLOTS` this is simply `0..len`; otherwise
+    /// it's a length-`VISIBLE_SLOTS` window starting at `primary`, wrapping.
+    pub fn visible_panes(&self) -> Vec<usize> {
+        let n = self.panes.len();
+        if n == 0 {
+            return Vec::new();
+        }
+        if n <= VISIBLE_SLOTS {
+            return (0..n).collect();
+        }
+        let start = self.primary.min(n - 1);
+        (0..VISIBLE_SLOTS).map(|i| (start + i) % n).collect()
+    }
+
+    /// Whether there are panes beyond the visible window.
+    pub fn has_overflow(&self) -> bool {
+        self.panes.len() > VISIBLE_SLOTS
+    }
+
+    /// If focus is currently outside the visible window, slide the window so
+    /// the focused pane becomes the primary slot. Returns true if `primary`
+    /// changed (so the caller can relayout to resize newly-visible panes).
+    fn ensure_focus_visible(&mut self) -> bool {
+        if !self.has_overflow() {
+            return false;
+        }
+        if self.visible_panes().contains(&self.focus) {
+            return false;
+        }
+        self.primary = self.focus;
+        true
+    }
+
     pub fn pane_widths(&self) -> Vec<u16> {
-        pane_widths(self.screen.0, self.panes.len().max(1))
+        pane_widths(self.screen.0, self.visible_panes().len().max(1))
     }
 
     pub fn context_height(&self) -> u16 {
@@ -129,8 +187,14 @@ impl App {
     pub fn relayout(&mut self) -> Result<()> {
         let widths = self.pane_widths();
         let rows = self.body_rows();
-        for (pane, w) in self.panes.iter_mut().zip(widths) {
-            pane.resize(w.max(1), rows)?;
+        // Only visible panes get resized — hidden panes keep their prior
+        // dimensions and will be resized when they slide back into view.
+        let visible = self.visible_panes();
+        for (slot, pane_idx) in visible.iter().enumerate() {
+            let w = widths.get(slot).copied().unwrap_or(1);
+            if let Some(pane) = self.panes.get_mut(*pane_idx) {
+                pane.resize(w.max(1), rows)?;
+            }
         }
         Ok(())
     }
@@ -139,6 +203,7 @@ impl App {
         let pane = Pane::spawn_shell(80, 24, &self.config)?;
         self.panes.push(pane);
         self.focus = self.panes.len() - 1;
+        self.ensure_focus_visible();
         self.relayout()?;
         Ok(())
     }
@@ -156,30 +221,67 @@ impl App {
         if self.focus >= self.panes.len() {
             self.focus = self.panes.len() - 1;
         }
+        if self.primary >= self.panes.len() {
+            self.primary = self.panes.len() - 1;
+        }
+        self.ensure_focus_visible();
         self.relayout()?;
         Ok(())
     }
 
-    pub fn focus_next(&mut self) {
+    pub fn focus_next(&mut self) -> Result<()> {
         if !self.panes.is_empty() {
             self.focus = (self.focus + 1) % self.panes.len();
+            if self.ensure_focus_visible() {
+                self.relayout()?;
+            }
         }
+        Ok(())
     }
 
-    pub fn focus_prev(&mut self) {
+    pub fn focus_prev(&mut self) -> Result<()> {
         if !self.panes.is_empty() {
             self.focus = if self.focus == 0 {
                 self.panes.len() - 1
             } else {
                 self.focus - 1
             };
+            if self.ensure_focus_visible() {
+                self.relayout()?;
+            }
         }
+        Ok(())
     }
 
-    pub fn focus_n(&mut self, n: usize) {
+    pub fn focus_n(&mut self, n: usize) -> Result<()> {
         if n < self.panes.len() {
             self.focus = n;
+            if self.ensure_focus_visible() {
+                self.relayout()?;
+            }
         }
+        Ok(())
+    }
+
+    pub fn open_pane_picker(&mut self) {
+        if self.panes.is_empty() {
+            return;
+        }
+        self.mode = InputMode::PanePicker(PanePickerState {
+            cursor: self.focus,
+        });
+    }
+
+    /// Commit the picker: the chosen pane becomes both the primary of the
+    /// visible window and the focused pane.
+    pub fn apply_pane_picker(&mut self, cursor: usize) -> Result<()> {
+        if cursor >= self.panes.len() {
+            return Ok(());
+        }
+        self.primary = cursor;
+        self.focus = cursor;
+        self.relayout()?;
+        Ok(())
     }
 
     pub fn open_settings(&mut self) {
@@ -223,7 +325,8 @@ impl App {
 
     pub fn enter_copy_mode(&mut self) {
         let Some(pane) = self.panes.get(self.focus) else { return };
-        self.mode = InputMode::Copy(CopyState::new(pane.rows, pane.cols));
+        let display_offset = pane.term.grid().display_offset();
+        self.mode = InputMode::Copy(CopyState::new(pane.rows, display_offset));
     }
 
     /// Exit copy mode and snap the focused pane back to the live edge.
@@ -234,14 +337,16 @@ impl App {
         }
     }
 
-    /// Which pane covers screen column `x`, if any.
+    /// Which pane covers screen column `x`, if any. Returns an absolute pane
+    /// index (into `self.panes`) for whichever visible slot contains `x`.
     pub fn pane_at_x(&self, x: u16) -> Option<usize> {
         let widths = self.pane_widths();
+        let visible = self.visible_panes();
         let mut acc: u16 = 0;
-        for (i, w) in widths.iter().enumerate() {
+        for (slot, w) in widths.iter().enumerate() {
             acc = acc.saturating_add(*w);
             if x < acc {
-                return Some(i);
+                return visible.get(slot).copied();
             }
         }
         None
@@ -295,6 +400,7 @@ pub async fn run<B: Backend>(terminal: &mut Terminal<B>) -> Result<()> {
     let mut app = App {
         panes: Vec::new(),
         focus: 0,
+        primary: 0,
         quit: false,
         mode: InputMode::Normal,
         screen: (size.width, size.height),
@@ -351,11 +457,9 @@ fn handle_event(app: &mut App, ev: Event) -> Result<()> {
 }
 
 fn handle_mouse(app: &mut App, me: MouseEvent) -> Result<()> {
-    // While in copy mode, ignore mouse events so the selection cursor doesn't
-    // drift against scrollback the user didn't ask to move.
-    if matches!(app.mode, InputMode::Copy(_)) {
-        return Ok(());
-    }
+    // Copy mode's cursor is anchored to absolute scrollback coordinates, so
+    // mouse scrolling is safe — it moves the viewport without dislodging the
+    // cursor from the content it points at.
     let Some(idx) = app.pane_at_x(me.column) else { return Ok(()) };
     match me.kind {
         MouseEventKind::ScrollUp => {
@@ -377,6 +481,12 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
     // Settings modal.
     if matches!(app.mode, InputMode::Settings(_)) {
         handle_settings_key(app, key)?;
+        return Ok(());
+    }
+
+    // Pane picker modal.
+    if matches!(app.mode, InputMode::PanePicker(_)) {
+        handle_pane_picker_key(app, key)?;
         return Ok(());
     }
 
@@ -420,15 +530,16 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
         match key.code {
             KeyCode::Char('n') => app.add_pane()?,
             KeyCode::Char('x') => app.close_focused()?,
-            KeyCode::Char('h') | KeyCode::Left => app.focus_prev(),
-            KeyCode::Char('l') | KeyCode::Right => app.focus_next(),
+            KeyCode::Char('h') | KeyCode::Left => app.focus_prev()?,
+            KeyCode::Char('l') | KeyCode::Right => app.focus_next()?,
             KeyCode::Char('q') => app.quit = true,
             KeyCode::Char('r') => app.start_rename(),
             KeyCode::Char('s') => app.open_settings(),
+            KeyCode::Char('p') => app.open_pane_picker(),
             KeyCode::Char('[') => app.enter_copy_mode(),
             KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
                 let n = (c as u8 - b'1') as usize;
-                app.focus_n(n);
+                app.focus_n(n)?;
             }
             // Ctrl-a a: pass a literal Ctrl-a through to the pane
             KeyCode::Char('a') => {
@@ -463,24 +574,32 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
 }
 
 fn handle_copy_key(app: &mut App, key: KeyEvent) -> Result<()> {
-    let (max_row, max_col) = match app.panes.get(app.focus) {
-        Some(p) => (
-            (p.rows.saturating_sub(1)) as usize,
-            (p.cols.saturating_sub(1)) as usize,
-        ),
+    // Snapshot the pane geometry up front so we can clamp against scrollback
+    // bounds without holding borrows across the mode match.
+    let (screen_lines, history_size, max_col) = match app.panes.get(app.focus) {
+        Some(p) => {
+            let g = p.term.grid();
+            (
+                g.screen_lines() as i32,
+                g.history_size() as i32,
+                (p.cols.saturating_sub(1)) as usize,
+            )
+        }
         None => {
             app.mode = InputMode::Normal;
             return Ok(());
         }
     };
+    let top_line = -history_size;
+    let bottom_line = screen_lines - 1;
 
-    // Commands that replace `app.mode` have to do their work after dropping
-    // the `&mut` borrow on the CopyState. We pull out the action first, then
-    // act on `app` once the borrow is released.
     enum Action {
         None,
         Cancel,
         Yank,
+        /// New cursor line after clamping. The caller reconciles the pane's
+        /// display_offset so the cursor stays visible.
+        FollowCursor,
     }
 
     let action = {
@@ -503,16 +622,16 @@ fn handle_copy_key(app: &mut App, key: KeyEvent) -> Result<()> {
                 Action::None
             }
             KeyCode::Char('j') | KeyCode::Down => {
-                if state.cursor.0 < max_row {
+                if state.cursor.0 < bottom_line {
                     state.cursor.0 += 1;
                 }
-                Action::None
+                Action::FollowCursor
             }
             KeyCode::Char('k') | KeyCode::Up => {
-                if state.cursor.0 > 0 {
+                if state.cursor.0 > top_line {
                     state.cursor.0 -= 1;
                 }
-                Action::None
+                Action::FollowCursor
             }
             KeyCode::Char('0') | KeyCode::Home => {
                 state.cursor.1 = 0;
@@ -523,12 +642,12 @@ fn handle_copy_key(app: &mut App, key: KeyEvent) -> Result<()> {
                 Action::None
             }
             KeyCode::Char('g') => {
-                state.cursor.0 = 0;
-                Action::None
+                state.cursor.0 = top_line;
+                Action::FollowCursor
             }
             KeyCode::Char('G') => {
-                state.cursor.0 = max_row;
-                Action::None
+                state.cursor.0 = bottom_line;
+                Action::FollowCursor
             }
             KeyCode::Char('v') | KeyCode::Char(' ') => {
                 state.anchor = match state.anchor {
@@ -545,13 +664,26 @@ fn handle_copy_key(app: &mut App, key: KeyEvent) -> Result<()> {
     match action {
         Action::None => {}
         Action::Cancel => app.exit_copy_mode(),
+        Action::FollowCursor => {
+            let InputMode::Copy(state) = &app.mode else { return Ok(()) };
+            let cursor_line = state.cursor.0;
+            let Some(pane) = app.panes.get_mut(app.focus) else { return Ok(()) };
+            // Keep the cursor visible: viewport shows absolute lines
+            // [-display_offset .. -display_offset + screen_lines). Adjust
+            // display_offset so cursor_line falls inside that window.
+            let display_offset = pane.term.grid().display_offset() as i32;
+            let view_top = -display_offset;
+            let view_bot = view_top + screen_lines - 1;
+            if cursor_line < view_top {
+                pane.scroll(view_top - cursor_line);
+            } else if cursor_line > view_bot {
+                pane.scroll(-(cursor_line - view_bot));
+            }
+        }
         Action::Yank => {
-            let (bounds, _cursor) = {
+            let bounds = {
                 let InputMode::Copy(state) = &app.mode else { return Ok(()) };
-                (
-                    state.selection_bounds().unwrap_or((state.cursor, state.cursor)),
-                    state.cursor,
-                )
+                state.selection_bounds().unwrap_or((state.cursor, state.cursor))
             };
             let Some(pane) = app.panes.get(app.focus) else { return Ok(()) };
             let text = pane.extract_text(bounds.0, bounds.1);
@@ -568,10 +700,13 @@ fn handle_copy_key(app: &mut App, key: KeyEvent) -> Result<()> {
     Ok(())
 }
 
-/// Emit an OSC 52 sequence so the host terminal puts `text` on the system
-/// clipboard. Terminals that don't implement OSC 52 (or have it disabled)
-/// will silently drop it.
+/// Put `text` on the system clipboard. Tries the native clipboard API first
+/// (reliable on desktop) and also emits OSC 52 so the copy still works when
+/// the app is running inside an SSH session on a remote host.
 fn copy_to_clipboard(text: &str) -> Result<()> {
+    if let Ok(mut clip) = arboard::Clipboard::new() {
+        let _ = clip.set_text(text.to_string());
+    }
     let encoded = base64_encode(text.as_bytes());
     let mut stdout = std::io::stdout().lock();
     write!(stdout, "\x1b]52;c;{}\x07", encoded)?;
@@ -600,6 +735,46 @@ fn base64_encode(input: &[u8]) -> String {
         }
     }
     out
+}
+
+fn handle_pane_picker_key(app: &mut App, key: KeyEvent) -> Result<()> {
+    let n = app.panes.len();
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.mode = InputMode::Normal;
+        }
+        KeyCode::Enter => {
+            let cursor = match std::mem::replace(&mut app.mode, InputMode::Normal) {
+                InputMode::PanePicker(s) => s.cursor,
+                _ => return Ok(()),
+            };
+            app.apply_pane_picker(cursor)?;
+        }
+        KeyCode::Char('j') | KeyCode::Down => {
+            if let InputMode::PanePicker(s) = &mut app.mode {
+                if n > 0 {
+                    s.cursor = (s.cursor + 1) % n;
+                }
+            }
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            if let InputMode::PanePicker(s) = &mut app.mode {
+                if n > 0 {
+                    s.cursor = if s.cursor == 0 { n - 1 } else { s.cursor - 1 };
+                }
+            }
+        }
+        // Quick-select pane 1-9 by number, committing immediately.
+        KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
+            let idx = (c as u8 - b'1') as usize;
+            if idx < n {
+                app.mode = InputMode::Normal;
+                app.apply_pane_picker(idx)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn handle_settings_key(app: &mut App, key: KeyEvent) -> Result<()> {
