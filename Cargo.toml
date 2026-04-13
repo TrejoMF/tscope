@@ -2,6 +2,10 @@
 name = "t-scope"
 version = "0.1.0"
 edition = "2024"
+description = "A terminal multiplexer with context-aware side panels for SSH, Claude Code, and service processes."
+license = "MIT"
+repository = "https://github.com/TrejoMF/tscope"
+readme = "README.md"
 
 [dependencies]
 ratatui = "0.29"
@@ -27,3 +31,8 @@ opt-level = 1
 [profile.release]
 lto = true
 codegen-units = 1
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
