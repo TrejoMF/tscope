@@ -131,7 +131,7 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
     let hidden = total.saturating_sub(visible_count);
 
     let mut spans: Vec<Span<'static>> = vec![
-        Span::raw(" t-scope  |  "),
+        Span::raw(" tscope  |  "),
         Span::raw(format!("panes: {}/{}", visible_count, total)),
     ];
     if hidden > 0 {
@@ -901,7 +901,10 @@ fn render_settings_modal(f: &mut Frame, app: &App, state: &SettingsState, area: 
 
 fn render_pane_picker_modal(f: &mut Frame, app: &App, state: &PanePickerState, area: Rect) {
     let row_count = app.panes.len().max(1) as u16;
-    let desired_h = (row_count + 6).min(area.height.saturating_sub(2));
+    // 8 fixed rows of chrome around the list: 2 borders + 2 vertical padding
+    // + subtitle + spacer + spacer + footer. Shrinking this below 8 clips
+    // entries off the bottom of the list.
+    let desired_h = (row_count + 8).min(area.height.saturating_sub(2));
     let width = 72u16.min(area.width.saturating_sub(4));
     let height = desired_h.max(8);
     let rect = center_rect(width, height, area);

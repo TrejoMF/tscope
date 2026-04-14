@@ -32,7 +32,7 @@ full height.
 
 Each pane can have a custom display name and accent color, keyed by the
 pane's initial working directory and persisted to
-`~/.config/t-scope/config.toml`. Open a pane in the same directory again
+`~/.config/tscope/config.toml`. Open a pane in the same directory again
 and the name/color come back automatically.
 
 ## Key bindings
@@ -90,7 +90,7 @@ mode so the cursor doesn't drift against content you didn't move.
 
 ## Config
 
-Stored at `~/.config/t-scope/config.toml`:
+Stored at `~/.config/tscope/config.toml`:
 
 ```toml
 [ssh_aliases]
@@ -114,23 +114,23 @@ aarch64), and Windows (x86_64).
 **macOS / Linux:**
 
 ```sh
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/TrejoMF/tscope/releases/latest/download/t-scope-installer.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/TrejoMF/tscope/releases/latest/download/tscope-installer.sh | sh
 ```
 
 **Windows (PowerShell):**
 
 ```powershell
-powershell -ExecutionPolicy ByPass -c "irm https://github.com/TrejoMF/tscope/releases/latest/download/t-scope-installer.ps1 | iex"
+powershell -ExecutionPolicy ByPass -c "irm https://github.com/TrejoMF/tscope/releases/latest/download/tscope-installer.ps1 | iex"
 ```
 
-Both installers drop the `t-scope` binary into a directory on your `PATH`
+Both installers drop the `tscope` binary into a directory on your `PATH`
 (e.g. `~/.local/bin` on Unix). Pin a specific version by replacing
 `latest/download` with `download/vX.Y.Z`.
 
 ### From crates.io
 
 ```sh
-cargo install t-scope
+cargo install tscope
 ```
 
 ### From source
@@ -152,7 +152,7 @@ cargo install --git https://github.com/TrejoMF/tscope.git
 After install:
 
 ```sh
-t-scope
+tscope
 ```
 
 Or from a checkout:

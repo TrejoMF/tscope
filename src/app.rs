@@ -1,7 +1,7 @@
 use alacritty_terminal::grid::Dimensions;
 use anyhow::Result;
 use crossterm::event::{
-    Event, EventStream, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind,
+    Event, EventStream, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use futures::StreamExt;
 use ratatui::prelude::*;
@@ -51,6 +51,11 @@ pub struct CopyState {
     pub anchor: Option<(i32, usize)>,
     /// Transient status line message (e.g. "copied N bytes").
     pub notice: Option<String>,
+    /// `true` while a mouse-drag selection is in progress. Used so Drag
+    /// events know they have an active selection to extend, and so MouseUp
+    /// can auto-yank without treating a keyboard-triggered selection as a
+    /// drag.
+    pub dragging: bool,
 }
 
 impl CopyState {
@@ -58,7 +63,7 @@ impl CopyState {
     /// entering copy mode while scrolled into history doesn't yank you back.
     pub fn new(rows: u16, display_offset: usize) -> Self {
         let line = rows.saturating_sub(1) as i32 - display_offset as i32;
-        Self { cursor: (line, 0), anchor: None, notice: None }
+        Self { cursor: (line, 0), anchor: None, notice: None, dragging: false }
     }
 
     /// Ordered (start, end) for the current selection, if any.
@@ -352,6 +357,62 @@ impl App {
         None
     }
 
+    /// Resolve a screen (x, y) to a pane and the cell inside it. Returns
+    /// `(pane_idx, abs_line, col)` where `abs_line` is in the same absolute
+    /// coordinate space as `CopyState.cursor` (negative = scrollback).
+    ///
+    /// Returns `None` if the click landed on the pane header, below the body,
+    /// or outside any pane horizontally.
+    pub fn pane_cell_at(&self, x: u16, y: u16) -> Option<(usize, i32, usize)> {
+        let idx = self.pane_at_x(x)?;
+        if y == 0 {
+            return None;
+        }
+        let pane = self.panes.get(idx)?;
+        let body_row = (y - 1) as usize;
+        if body_row >= pane.rows as usize {
+            return None;
+        }
+        let widths = self.pane_widths();
+        let visible = self.visible_panes();
+        let slot = visible.iter().position(|i| *i == idx)?;
+        let x_start: u16 = widths.iter().take(slot).sum();
+        let col = x.saturating_sub(x_start) as usize;
+        let col = col.min((pane.cols as usize).saturating_sub(1));
+        let display_offset = pane.term.grid().display_offset() as i32;
+        let abs_line = body_row as i32 - display_offset;
+        Some((idx, abs_line, col))
+    }
+
+    /// Clamp a screen (x, y) to the interior of the given pane and return
+    /// `(abs_line, col)`. Used while dragging so the selection cursor stays
+    /// inside the pane the drag started in, even if the mouse wanders into
+    /// a neighbour or beyond the pane's body.
+    pub fn pane_cell_clamped(&self, pane_idx: usize, x: u16, y: u16) -> Option<(i32, usize)> {
+        let pane = self.panes.get(pane_idx)?;
+        let widths = self.pane_widths();
+        let visible = self.visible_panes();
+        let slot = visible.iter().position(|i| *i == pane_idx)?;
+        let x_start: u16 = widths.iter().take(slot).sum();
+        let x_end = x_start + widths[slot];
+        let col = if x < x_start {
+            0
+        } else if x >= x_end {
+            (pane.cols as usize).saturating_sub(1)
+        } else {
+            (x - x_start) as usize
+        };
+        let col = col.min((pane.cols as usize).saturating_sub(1));
+        let body_row = if y <= 0 {
+            0
+        } else {
+            let r = (y - 1) as usize;
+            r.min((pane.rows as usize).saturating_sub(1))
+        };
+        let display_offset = pane.term.grid().display_offset() as i32;
+        Some((body_row as i32 - display_offset, col))
+    }
+
     /// Begin a rename prompt if the focused pane is an ssh connection.
     /// Pre-populates the buffer with the existing name (if any).
     pub fn start_rename(&mut self) {
@@ -457,19 +518,85 @@ fn handle_event(app: &mut App, ev: Event) -> Result<()> {
 }
 
 fn handle_mouse(app: &mut App, me: MouseEvent) -> Result<()> {
-    // Copy mode's cursor is anchored to absolute scrollback coordinates, so
-    // mouse scrolling is safe — it moves the viewport without dislodging the
-    // cursor from the content it points at.
-    let Some(idx) = app.pane_at_x(me.column) else { return Ok(()) };
     match me.kind {
         MouseEventKind::ScrollUp => {
-            if let Some(p) = app.panes.get_mut(idx) {
-                p.scroll(3);
+            if let Some(idx) = app.pane_at_x(me.column) {
+                if let Some(p) = app.panes.get_mut(idx) {
+                    p.scroll(3);
+                }
             }
         }
         MouseEventKind::ScrollDown => {
-            if let Some(p) = app.panes.get_mut(idx) {
-                p.scroll(-3);
+            if let Some(idx) = app.pane_at_x(me.column) {
+                if let Some(p) = app.panes.get_mut(idx) {
+                    p.scroll(-3);
+                }
+            }
+        }
+        MouseEventKind::Down(MouseButton::Left) => {
+            let Some((pane_idx, abs_line, col)) = app.pane_cell_at(me.column, me.row) else {
+                return Ok(());
+            };
+            // Left-click anchors a new selection in the clicked pane. Switch
+            // focus so the existing copy-mode plumbing (rendering, key
+            // handling, extract_text) all operate on the right pane.
+            app.focus = pane_idx;
+            let (rows, display_offset) = {
+                let pane = &app.panes[pane_idx];
+                (pane.rows, pane.term.grid().display_offset())
+            };
+            let mut state = CopyState::new(rows, display_offset);
+            state.cursor = (abs_line, col);
+            state.anchor = Some((abs_line, col));
+            state.dragging = true;
+            app.mode = InputMode::Copy(state);
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            let dragging = matches!(&app.mode, InputMode::Copy(s) if s.dragging);
+            if !dragging {
+                return Ok(());
+            }
+            let focus = app.focus;
+            // Auto-scroll when the pointer leaves the pane body vertically —
+            // lets a single drag span more than one screenful.
+            let pane_rows = app.panes.get(focus).map(|p| p.rows).unwrap_or(0);
+            if me.row == 0 {
+                if let Some(p) = app.panes.get_mut(focus) { p.scroll(1); }
+            } else if me.row >= 1 + pane_rows {
+                if let Some(p) = app.panes.get_mut(focus) { p.scroll(-1); }
+            }
+            let Some((abs_line, col)) = app.pane_cell_clamped(focus, me.column, me.row) else {
+                return Ok(());
+            };
+            if let InputMode::Copy(state) = &mut app.mode {
+                state.cursor = (abs_line, col);
+            }
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            let InputMode::Copy(state) = &app.mode else { return Ok(()) };
+            if !state.dragging {
+                return Ok(());
+            }
+            let bounds = state.selection_bounds();
+            let empty = match bounds {
+                Some((a, b)) => a == b,
+                None => true,
+            };
+            if empty {
+                // Single click without drag: leave copy mode so the click
+                // acts like a focus tap.
+                app.exit_copy_mode();
+                return Ok(());
+            }
+            let (start, end) = bounds.unwrap();
+            let text = app.panes[app.focus].extract_text(start, end);
+            let bytes = text.len();
+            if bytes > 0 {
+                copy_to_clipboard(&text)?;
+            }
+            if let InputMode::Copy(state) = &mut app.mode {
+                state.dragging = false;
+                state.notice = Some(format!("copied {} bytes", bytes));
             }
         }
         _ => {}
@@ -524,7 +651,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
         return Ok(());
     }
 
-    // Prefix mode: interpret next keystroke as a t-scope command.
+    // Prefix mode: interpret next keystroke as a tscope command.
     if matches!(app.mode, InputMode::Prefix) {
         app.mode = InputMode::Normal;
         match key.code {

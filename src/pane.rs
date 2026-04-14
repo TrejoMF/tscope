@@ -7,7 +7,7 @@ use alacritty_terminal::vte::ansi::Processor;
 use alacritty_terminal::Term;
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use portable_pty::{CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
+use portable_pty::{Child, CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
 use std::io::{Read, Write};
 use std::sync::mpsc;
 use std::thread;
@@ -32,6 +32,10 @@ pub struct Pane {
     writer: Box<dyn Write + Send>,
     rx: mpsc::Receiver<Vec<u8>>,
     master: Box<dyn MasterPty + Send>,
+    /// Child shell process. Held so we can SIGKILL it on drop; relying on
+    /// SIGHUP propagation alone leaks daemons that were nohup'd or put
+    /// themselves in a new session.
+    child: Box<dyn Child + Send + Sync>,
     pub cols: u16,
     pub rows: u16,
     pub proc_info: Option<ProcessInfo>,
@@ -72,7 +76,7 @@ impl Pane {
             .as_ref()
             .map(|cwd| config.lookup_pane_settings(cwd))
             .unwrap_or_default();
-        let _child = pair.slave.spawn_command(cmd)?;
+        let child = pair.slave.spawn_command(cmd)?;
         drop(pair.slave);
 
         let mut reader = pair.master.try_clone_reader()?;
@@ -104,6 +108,7 @@ impl Pane {
             writer,
             rx,
             master: pair.master,
+            child,
             cols,
             rows,
             proc_info: None,
@@ -359,6 +364,21 @@ impl Pane {
         self.cols = cols;
         self.rows = rows;
         Ok(())
+    }
+}
+
+impl Drop for Pane {
+    /// Ensure the shell process is torn down when the pane goes away. SIGHUP
+    /// via master-close handles the common case, but a SIGKILL here also
+    /// cleans up children that caught HUP (daemons, nohup'd jobs, anything
+    /// that put itself in a new session). `try_wait` lets us skip the kill
+    /// if the child already exited.
+    fn drop(&mut self) {
+        if let Ok(Some(_)) = self.child.try_wait() {
+            return;
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 

@@ -3,7 +3,6 @@ use std::time::SystemTime;
 
 #[derive(Clone, Debug, Default)]
 pub struct ProcessInfo {
-    pub pid: i32,
     pub name: String,
     pub exe_path: Option<String>,
     pub argv: Vec<String>,
@@ -66,7 +65,6 @@ pub fn inspect(pid: i32) -> Option<ProcessInfo> {
             std::time::UNIX_EPOCH + std::time::Duration::from_secs(info.pbi_start_tvsec)
         });
     Some(ProcessInfo {
-        pid,
         name,
         exe_path,
         argv,
