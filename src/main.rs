@@ -3,6 +3,7 @@ mod claude;
 mod config;
 mod pane;
 mod process;
+#[cfg(target_os = "macos")]
 mod service;
 mod ssh;
 mod theme;

@@ -18,12 +18,14 @@ use std::path::PathBuf;
 use crate::claude::{self, ClaudeContext};
 use crate::config::{Config, PaneSettings};
 use crate::process::{self, ProcessInfo};
+#[cfg(target_os = "macos")]
 use crate::service::{self, ServiceContext};
 use crate::ssh::SshContext;
 
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// How often we shell out to `lsof` to (re)discover listening services.
 /// Resource sampling for a known service runs on the normal 500ms cadence.
+#[cfg(target_os = "macos")]
 const SERVICE_DISCOVERY_INTERVAL: Duration = Duration::from_secs(2);
 
 pub struct Pane {
@@ -42,7 +44,9 @@ pub struct Pane {
     last_poll: Instant,
     pub claude: Option<ClaudeContext>,
     pub ssh: Option<SshContext>,
+    #[cfg(target_os = "macos")]
     pub service: Option<ServiceContext>,
+    #[cfg(target_os = "macos")]
     last_service_discovery: Instant,
     /// Accumulates printable chars typed since the last Enter, so we can
     /// surface them as the "last command" for ssh sessions.
@@ -117,7 +121,9 @@ impl Pane {
                 .unwrap_or_else(Instant::now),
             claude: None,
             ssh: None,
+            #[cfg(target_os = "macos")]
             service: None,
+            #[cfg(target_os = "macos")]
             last_service_discovery: Instant::now()
                 .checked_sub(SERVICE_DISCOVERY_INTERVAL)
                 .unwrap_or_else(Instant::now),
@@ -141,9 +147,11 @@ impl Pane {
         }
         self.sync_claude();
         self.sync_ssh(config);
+        #[cfg(target_os = "macos")]
         self.sync_service();
     }
 
+    #[cfg(target_os = "macos")]
     fn sync_service(&mut self) {
         // Claude / SSH panes own the panel when present; skip service detection.
         if self.claude.is_some() || self.ssh.is_some() {

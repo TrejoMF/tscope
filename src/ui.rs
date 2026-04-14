@@ -244,6 +244,7 @@ fn render_context_panel(f: &mut Frame, app: &App, area: Rect) {
         render_ssh_panel(f, pane, ssh, area);
         return;
     }
+    #[cfg(target_os = "macos")]
     if let Some(svc) = pane.service.as_ref() {
         render_service_panel(f, svc, area);
     }
@@ -559,6 +560,7 @@ fn render_ssh_panel(f: &mut Frame, pane: &Pane, ssh: &crate::ssh::SshContext, ar
     f.render_widget(Paragraph::new(remote_line), chunks[4]);
 }
 
+#[cfg(target_os = "macos")]
 fn render_service_panel(
     f: &mut Frame,
     svc: &crate::service::ServiceContext,

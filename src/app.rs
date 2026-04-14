@@ -172,7 +172,12 @@ impl App {
     pub fn context_height(&self) -> u16 {
         let pane = self.panes.get(self.focus);
         let has_context = pane
-            .map(|p| p.claude.is_some() || p.ssh.is_some() || p.service.is_some())
+            .map(|p| {
+                let base = p.claude.is_some() || p.ssh.is_some();
+                #[cfg(target_os = "macos")]
+                let base = base || p.service.is_some();
+                base
+            })
             .unwrap_or(false);
         if has_context {
             CONTEXT_PANEL_ROWS
