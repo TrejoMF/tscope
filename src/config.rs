@@ -19,7 +19,7 @@ impl PaneSettings {
     }
 }
 
-/// On-disk shape of t-scope's config (`~/.config/t-scope/config.toml`).
+/// On-disk shape of tscope's config (`~/.config/tscope/config.toml`).
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Config {
     /// Map from "user@host" (or plain "host") to a user-friendly name.
@@ -34,7 +34,7 @@ impl Config {
     pub fn path() -> PathBuf {
         dirs::config_dir()
             .unwrap_or_else(|| PathBuf::from("."))
-            .join("t-scope")
+            .join("tscope")
             .join("config.toml")
     }
 

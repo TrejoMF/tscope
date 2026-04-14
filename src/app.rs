@@ -651,7 +651,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
         return Ok(());
     }
 
-    // Prefix mode: interpret next keystroke as a t-scope command.
+    // Prefix mode: interpret next keystroke as a tscope command.
     if matches!(app.mode, InputMode::Prefix) {
         app.mode = InputMode::Normal;
         match key.code {

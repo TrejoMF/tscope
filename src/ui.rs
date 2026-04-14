@@ -131,7 +131,7 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
     let hidden = total.saturating_sub(visible_count);
 
     let mut spans: Vec<Span<'static>> = vec![
-        Span::raw(" t-scope  |  "),
+        Span::raw(" tscope  |  "),
         Span::raw(format!("panes: {}/{}", visible_count, total)),
     ];
     if hidden > 0 {
