@@ -38,6 +38,9 @@ pub enum InputMode {
 #[derive(Debug)]
 pub struct PanePickerState {
     pub cursor: usize,
+    /// `Some(buffer)` while the user is renaming the pane at `cursor`;
+    /// `None` during normal navigation.
+    pub editing: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -234,6 +237,33 @@ impl App {
         Ok(())
     }
 
+    /// Remove the pane at `idx` (not necessarily the focused one). Adjusts
+    /// `focus` and `primary` so they still point at valid panes; quits if the
+    /// last pane is killed.
+    pub fn close_pane(&mut self, idx: usize) -> Result<()> {
+        if idx >= self.panes.len() {
+            return Ok(());
+        }
+        self.panes.remove(idx);
+        if self.panes.is_empty() {
+            self.quit = true;
+            return Ok(());
+        }
+        if self.focus > idx {
+            self.focus -= 1;
+        } else if self.focus >= self.panes.len() {
+            self.focus = self.panes.len() - 1;
+        }
+        if self.primary > idx {
+            self.primary -= 1;
+        } else if self.primary >= self.panes.len() {
+            self.primary = self.panes.len() - 1;
+        }
+        self.ensure_focus_visible();
+        self.relayout()?;
+        Ok(())
+    }
+
     pub fn focus_next(&mut self) -> Result<()> {
         if !self.panes.is_empty() {
             self.focus = (self.focus + 1) % self.panes.len();
@@ -274,7 +304,22 @@ impl App {
         }
         self.mode = InputMode::PanePicker(PanePickerState {
             cursor: self.focus,
+            editing: None,
         });
+    }
+
+    /// Persist a new name for the pane at `idx`. Empty / whitespace clears it.
+    pub fn rename_pane(&mut self, idx: usize, new_name: String) -> Result<()> {
+        let Some(pane) = self.panes.get_mut(idx) else { return Ok(()) };
+        let trimmed = new_name.trim().to_string();
+        let mut ps = pane.settings.clone();
+        ps.name = if trimmed.is_empty() { None } else { Some(trimmed) };
+        pane.settings = ps.clone();
+        if let Some(cwd) = pane.initial_cwd.clone() {
+            self.config.set_pane_settings(&cwd, ps);
+            self.config.save()?;
+        }
+        Ok(())
     }
 
     /// Commit the picker: the chosen pane becomes both the primary of the
@@ -875,6 +920,58 @@ fn base64_encode(input: &[u8]) -> String {
 
 fn handle_pane_picker_key(app: &mut App, key: KeyEvent) -> Result<()> {
     let n = app.panes.len();
+
+    // DEBUG: log every key that reaches the picker. File at /tmp/tscope-keys.log.
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/tscope-keys.log")
+    {
+        let _ = writeln!(f, "picker key: code={:?} mods={:?}", key.code, key.modifiers);
+    }
+
+    // Rename sub-mode: consume text input, don't let it fall through to
+    // navigation / quick-select shortcuts.
+    let is_editing = matches!(
+        &app.mode,
+        InputMode::PanePicker(s) if s.editing.is_some()
+    );
+    if is_editing {
+        match key.code {
+            KeyCode::Esc => {
+                if let InputMode::PanePicker(s) = &mut app.mode {
+                    s.editing = None;
+                }
+            }
+            KeyCode::Enter => {
+                let (cursor, buffer) = match &mut app.mode {
+                    InputMode::PanePicker(s) => {
+                        let buf = s.editing.take().unwrap_or_default();
+                        (s.cursor, buf)
+                    }
+                    _ => return Ok(()),
+                };
+                app.rename_pane(cursor, buffer)?;
+            }
+            KeyCode::Backspace => {
+                if let InputMode::PanePicker(s) = &mut app.mode {
+                    if let Some(buf) = s.editing.as_mut() {
+                        buf.pop();
+                    }
+                }
+            }
+            KeyCode::Char(c) => {
+                if let InputMode::PanePicker(s) = &mut app.mode {
+                    if let Some(buf) = s.editing.as_mut() {
+                        buf.push(c);
+                    }
+                }
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
+
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') => {
             app.mode = InputMode::Normal;
@@ -898,6 +995,49 @@ fn handle_pane_picker_key(app: &mut App, key: KeyEvent) -> Result<()> {
                 if n > 0 {
                     s.cursor = if s.cursor == 0 { n - 1 } else { s.cursor - 1 };
                 }
+            }
+        }
+        // Kill the pane under the cursor. Uppercase-only so lowercase `k`
+        // still means "cursor up" and accidental kills are harder.
+        KeyCode::Char('K') => {
+            let cursor = match &app.mode {
+                InputMode::PanePicker(s) => s.cursor,
+                _ => return Ok(()),
+            };
+            app.close_pane(cursor)?;
+            if app.panes.is_empty() {
+                app.mode = InputMode::Normal;
+                return Ok(());
+            }
+            if let InputMode::PanePicker(s) = &mut app.mode {
+                if s.cursor >= app.panes.len() {
+                    s.cursor = app.panes.len() - 1;
+                }
+            }
+        }
+        // Spawn a new shell pane and park the cursor on it, without leaving
+        // the picker — user can then rename (R) or commit (Enter).
+        KeyCode::Char('n') | KeyCode::Char('N') => {
+            app.add_pane()?;
+            let new_idx = app.panes.len().saturating_sub(1);
+            if let InputMode::PanePicker(s) = &mut app.mode {
+                s.cursor = new_idx;
+            }
+        }
+        // Enter rename mode for the pane under the cursor, prefilled with its
+        // current name.
+        KeyCode::Char('r') | KeyCode::Char('R') => {
+            let cursor = match &app.mode {
+                InputMode::PanePicker(s) => s.cursor,
+                _ => return Ok(()),
+            };
+            let prefill = app
+                .panes
+                .get(cursor)
+                .and_then(|p| p.settings.name.clone())
+                .unwrap_or_default();
+            if let InputMode::PanePicker(s) = &mut app.mode {
+                s.editing = Some(prefill);
             }
         }
         // Quick-select pane 1-9 by number, committing immediately.

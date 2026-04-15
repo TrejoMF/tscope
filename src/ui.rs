@@ -916,12 +916,26 @@ fn render_pane_picker_modal(f: &mut Frame, app: &App, state: &PanePickerState, a
     ])
     .split(inner);
 
-    let subtitle = Line::from(vec![
-        Span::styled(
-            "Pick a pane to place it in the leftmost slot.",
-            Style::default().fg(Color::DarkGray),
-        ),
-    ]);
+    let subtitle = if state.editing.is_some() {
+        Line::from(vec![
+            Span::styled(
+                "Renaming pane — type a new name, ",
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled(
+                "Enter",
+                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" saves.", Style::default().fg(Color::DarkGray)),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled(
+                "Pick a pane to place it in the leftmost slot.",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ])
+    };
     f.render_widget(Paragraph::new(subtitle), chunks[0]);
 
     let visible_set: std::collections::HashSet<usize> =
@@ -940,6 +954,7 @@ fn render_pane_picker_modal(f: &mut Frame, app: &App, state: &PanePickerState, a
             .and_then(theme::color_from_name)
             .unwrap_or(Color::Blue);
 
+        let editing_this = selected && state.editing.is_some();
         let name = pane
             .settings
             .name
@@ -976,7 +991,7 @@ fn render_pane_picker_modal(f: &mut Frame, app: &App, state: &PanePickerState, a
             Style::default()
         };
 
-        let spans = vec![
+        let mut spans = vec![
             Span::styled(
                 cursor_marker,
                 if selected {
@@ -990,30 +1005,57 @@ fn render_pane_picker_modal(f: &mut Frame, app: &App, state: &PanePickerState, a
             Span::raw(" "),
             Span::styled("  ", Style::default().bg(accent)),
             Span::raw(" "),
-            Span::styled(
+        ];
+        if editing_this {
+            let buffer = state.editing.as_deref().unwrap_or("");
+            spans.push(Span::styled(
+                buffer.to_string(),
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::styled(
+                "▍",
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            ));
+        } else {
+            spans.push(Span::styled(
                 name,
                 Style::default()
                     .fg(Color::White)
                     .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("  ·  ", Style::default().fg(Color::DarkGray)),
-            Span::styled(cmd, Style::default().fg(Color::Cyan)),
-        ];
+            ));
+        }
+        spans.push(Span::styled("  ·  ", Style::default().fg(Color::DarkGray)));
+        spans.push(Span::styled(cmd, Style::default().fg(Color::Cyan)));
         lines.push(Line::from(spans).style(row_style));
     }
 
     f.render_widget(Paragraph::new(lines), chunks[2]);
 
-    let footer = Line::from(vec![
-        Span::styled("↑/↓", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-        Span::styled(" move · ", Style::default().fg(Color::DarkGray)),
-        Span::styled("1-9", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-        Span::styled(" quick-select · ", Style::default().fg(Color::DarkGray)),
-        Span::styled("Enter", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-        Span::styled(" show · ", Style::default().fg(Color::DarkGray)),
-        Span::styled("Esc", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
-        Span::styled(" cancel", Style::default().fg(Color::DarkGray)),
-    ]);
+    let footer = if state.editing.is_some() {
+        Line::from(vec![
+            Span::styled("Enter", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled(" save · ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Esc", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+            Span::styled(" cancel rename · ", Style::default().fg(Color::DarkGray)),
+            Span::styled("⌫", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(" delete", Style::default().fg(Color::DarkGray)),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled("↑/↓", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(" move · ", Style::default().fg(Color::DarkGray)),
+            Span::styled("N", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(" new · ", Style::default().fg(Color::DarkGray)),
+            Span::styled("R", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(" rename · ", Style::default().fg(Color::DarkGray)),
+            Span::styled("K", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+            Span::styled(" kill · ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Enter", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled(" show · ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Esc", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+            Span::styled(" cancel", Style::default().fg(Color::DarkGray)),
+        ])
+    };
     f.render_widget(Paragraph::new(footer), chunks[4]);
 }
 
