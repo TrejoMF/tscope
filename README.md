@@ -108,22 +108,14 @@ SSH panes. `pane_aliases` is keyed by absolute working directory.
 
 ### Prebuilt binaries (recommended)
 
-Releases are built for macOS (Apple Silicon + Intel), Linux (x86_64 +
-aarch64), and Windows (x86_64).
-
-**macOS / Linux:**
+Releases are built for macOS (Apple Silicon + Intel) and Linux (x86_64 +
+aarch64).
 
 ```sh
 curl --proto '=https' --tlsv1.2 -LsSf https://github.com/TrejoMF/tscope/releases/latest/download/tscope-installer.sh | sh
 ```
 
-**Windows (PowerShell):**
-
-```powershell
-powershell -ExecutionPolicy ByPass -c "irm https://github.com/TrejoMF/tscope/releases/latest/download/tscope-installer.ps1 | iex"
-```
-
-Both installers drop the `tscope` binary into a directory on your `PATH`
+The installer drops the `tscope` binary into a directory on your `PATH`
 (e.g. `~/.local/bin` on Unix). Pin a specific version by replacing
 `latest/download` with `download/vX.Y.Z`.
 
