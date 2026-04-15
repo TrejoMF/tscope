@@ -926,15 +926,6 @@ fn base64_encode(input: &[u8]) -> String {
 fn handle_pane_picker_key(app: &mut App, key: KeyEvent) -> Result<()> {
     let n = app.panes.len();
 
-    // DEBUG: log every key that reaches the picker. File at /tmp/tscope-keys.log.
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("/tmp/tscope-keys.log")
-    {
-        let _ = writeln!(f, "picker key: code={:?} mods={:?}", key.code, key.modifiers);
-    }
-
     // Rename sub-mode: consume text input, don't let it fall through to
     // navigation / quick-select shortcuts.
     let is_editing = matches!(
