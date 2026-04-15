@@ -1,6 +1,7 @@
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line as GridLine};
 use alacritty_terminal::term::cell::Flags;
+use alacritty_terminal::term::TermMode;
 use alacritty_terminal::vte::ansi::{Color as AlacColor, NamedColor};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph, Wrap};
@@ -51,7 +52,16 @@ pub fn draw(f: &mut Frame, app: &App) {
             } else {
                 None
             };
-            render_pane(f, pane, rect, pane_idx, pane_idx == app.focus, copy);
+            let allow_cursor = matches!(app.mode, InputMode::Normal);
+            render_pane(
+                f,
+                pane,
+                rect,
+                pane_idx,
+                pane_idx == app.focus,
+                copy,
+                allow_cursor,
+            );
             if slot > 0 {
                 // Colour the divider with the *left* pane's accent so each
                 // pane ends in its own colour bar on its right edge.
@@ -191,6 +201,7 @@ fn render_pane(
     idx: usize,
     focused: bool,
     copy: Option<&CopyState>,
+    allow_cursor: bool,
 ) {
     let chunks = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(rect);
     let header_area = chunks[0];
@@ -259,6 +270,24 @@ fn render_pane(
     }
 
     f.render_widget(Paragraph::new(lines), body_area);
+
+    if focused
+        && allow_cursor
+        && copy.is_none()
+        && pane.term.mode().contains(TermMode::SHOW_CURSOR)
+    {
+        let cursor_point = grid.cursor.point;
+        let viewport_row = cursor_point.line.0 + display_offset;
+        let cursor_col = cursor_point.column.0;
+        if viewport_row >= 0
+            && (viewport_row as usize) < render_rows
+            && cursor_col < render_cols
+        {
+            let x = body_area.x + cursor_col as u16;
+            let y = body_area.y + viewport_row as u16;
+            f.set_cursor_position((x, y));
+        }
+    }
 }
 
 fn render_context_panel(f: &mut Frame, app: &App, area: Rect) {
