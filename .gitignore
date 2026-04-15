@@ -1,1 +1,14 @@
 /target
+
+# macOS
+.DS_Store
+
+# Editors / IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Local notes
+cargo-update-readme.md

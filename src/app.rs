@@ -347,9 +347,13 @@ impl App {
     pub fn pane_at_x(&self, x: u16) -> Option<usize> {
         let widths = self.pane_widths();
         let visible = self.visible_panes();
+        let last = widths.len().saturating_sub(1);
         let mut acc: u16 = 0;
         for (slot, w) in widths.iter().enumerate() {
-            acc = acc.saturating_add(*w);
+            // Include the divider column after this pane (if any) so a click
+            // directly on the divider maps to the pane on its left.
+            let step = *w + if slot < last { 1 } else { 0 };
+            acc = acc.saturating_add(step);
             if x < acc {
                 return visible.get(slot).copied();
             }
@@ -376,7 +380,7 @@ impl App {
         let widths = self.pane_widths();
         let visible = self.visible_panes();
         let slot = visible.iter().position(|i| *i == idx)?;
-        let x_start: u16 = widths.iter().take(slot).sum();
+        let x_start: u16 = widths.iter().take(slot).sum::<u16>() + slot as u16;
         let col = x.saturating_sub(x_start) as usize;
         let col = col.min((pane.cols as usize).saturating_sub(1));
         let display_offset = pane.term.grid().display_offset() as i32;
@@ -393,7 +397,7 @@ impl App {
         let widths = self.pane_widths();
         let visible = self.visible_panes();
         let slot = visible.iter().position(|i| *i == pane_idx)?;
-        let x_start: u16 = widths.iter().take(slot).sum();
+        let x_start: u16 = widths.iter().take(slot).sum::<u16>() + slot as u16;
         let x_end = x_start + widths[slot];
         let col = if x < x_start {
             0
@@ -447,10 +451,15 @@ impl App {
     }
 }
 
+/// Split `screen_w` across `n` panes, reserving one column between each
+/// adjacent pair for a visual divider. Returns the width of each pane (the
+/// dividers are not part of any pane's rect).
 pub fn pane_widths(screen_w: u16, n: usize) -> Vec<u16> {
     let n_u16 = n.max(1) as u16;
-    let base = screen_w / n_u16;
-    let rem = screen_w % n_u16;
+    let dividers = n_u16.saturating_sub(1);
+    let usable = screen_w.saturating_sub(dividers);
+    let base = usable / n_u16;
+    let rem = usable % n_u16;
     (0..n)
         .map(|i| base + if (i as u16) < rem { 1 } else { 0 })
         .collect()

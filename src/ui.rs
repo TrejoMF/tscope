@@ -26,24 +26,44 @@ pub fn draw(f: &mut Frame, app: &App) {
         (chunks[0], None, chunks[1])
     };
 
-    // Horizontal split: one column per *visible* pane. Panes beyond the
-    // visible window stay alive (PTY keeps draining) but aren't drawn or
-    // resized — they'll be resized the next time they slide into view.
+    // Horizontal split: one column per *visible* pane, with a 1-col accent
+    // divider between adjacent panes. Panes beyond the visible window stay
+    // alive (PTY keeps draining) but aren't drawn or resized — they'll be
+    // resized the next time they slide into view.
     let widths = app.pane_widths();
     let visible = app.visible_panes();
     if !widths.is_empty() && !visible.is_empty() {
-        let constraints: Vec<Constraint> =
-            widths.iter().map(|w| Constraint::Length(*w)).collect();
-        let pane_rects = Layout::horizontal(constraints).split(pane_area);
+        let mut constraints: Vec<Constraint> = Vec::with_capacity(widths.len() * 2);
+        for (i, w) in widths.iter().enumerate() {
+            if i > 0 {
+                constraints.push(Constraint::Length(1)); // divider
+            }
+            constraints.push(Constraint::Length(*w));
+        }
+        let rects = Layout::horizontal(constraints).split(pane_area);
         for (slot, &pane_idx) in visible.iter().enumerate() {
             let Some(pane) = app.panes.get(pane_idx) else { continue };
-            let rect = pane_rects[slot];
+            // With dividers interleaved, pane at slot `s` lives at layout
+            // index `2*s` and the divider between panes s-1 and s at `2*s-1`.
+            let rect = rects[slot * 2];
             let copy = if pane_idx == app.focus {
                 if let InputMode::Copy(state) = &app.mode { Some(state) } else { None }
             } else {
                 None
             };
             render_pane(f, pane, rect, pane_idx, pane_idx == app.focus, copy);
+            if slot > 0 {
+                // Colour the divider with the *left* pane's accent so each
+                // pane ends in its own colour bar on its right edge.
+                let left_idx = visible[slot - 1];
+                let left_accent = app
+                    .panes
+                    .get(left_idx)
+                    .and_then(|p| p.settings.color.as_deref())
+                    .and_then(theme::color_from_name)
+                    .unwrap_or(Color::DarkGray);
+                render_divider(f, rects[slot * 2 - 1], left_accent);
+            }
         }
     }
 
@@ -155,6 +175,15 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(status, area);
 }
 
+fn render_divider(f: &mut Frame, area: Rect, color: Color) {
+    let line = "│".repeat(area.height as usize);
+    let lines: Vec<Line<'static>> = line
+        .chars()
+        .map(|c| Line::from(Span::styled(c.to_string(), Style::default().fg(color))))
+        .collect();
+    f.render_widget(Paragraph::new(lines), area);
+}
+
 fn render_pane(
     f: &mut Frame,
     pane: &Pane,
@@ -250,13 +279,8 @@ fn render_context_panel(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_claude_panel(f: &mut Frame, ctx: &crate::claude::ClaudeContext, area: Rect) {
+    let cwd_display = shorten_home(&ctx.session_cwd);
 
-    let session_display = shorten_home(&ctx.session_path);
-    let branch = ctx.git_branch.as_deref().unwrap_or("?");
-    let tool_total = ctx.tool_count_total();
-    let top_tools = ctx.top_tools(3);
-
-    // --- titled bordered block ----------------------------------------------
     let title_line = Line::from(vec![
         Span::raw(" "),
         Span::styled(
@@ -265,43 +289,6 @@ fn render_claude_panel(f: &mut Frame, ctx: &crate::claude::ClaudeContext, area: 
                 .fg(Color::LightMagenta)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled("  ", Style::default()),
-        dim_sep(),
-        Span::styled(
-            format!(" {} ", session_display),
-            Style::default().fg(Color::White),
-        ),
-        dim_sep(),
-        Span::raw(" "),
-        Span::styled("⎇ ", Style::default().fg(Color::Green)),
-        Span::styled(
-            branch,
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" "),
-        dim_sep(),
-        Span::raw(" "),
-        Span::styled(
-            format!("turn {}", ctx.turn_count),
-            Style::default().fg(Color::Cyan),
-        ),
-        Span::raw(" "),
-        dim_sep(),
-        Span::raw(" "),
-        Span::styled(
-            format!("⚒ {}", tool_total),
-            Style::default().fg(Color::Yellow),
-        ),
-        if top_tools.is_empty() {
-            Span::raw("")
-        } else {
-            Span::styled(
-                format!(" ({})", top_tools),
-                Style::default().fg(Color::DarkGray),
-            )
-        },
         Span::raw(" "),
     ]);
 
@@ -316,66 +303,21 @@ fn render_claude_panel(f: &mut Frame, ctx: &crate::claude::ClaudeContext, area: 
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    // --- inner layout --------------------------------------------------------
-    // Rows: [tool=1][about wrap=2][trail wrap=2][you=1] = 6 inside an 8-row inner.
     let chunks = Layout::vertical([
-        Constraint::Length(1), // tool
-        Constraint::Length(2), // about (wraps)
-        Constraint::Min(2),    // trail (wraps, grows)
-        Constraint::Length(1), // you
+        Constraint::Length(1), // pwd
+        Constraint::Length(1), // spacer
+        Constraint::Min(1),    // you (wraps)
     ])
     .split(inner);
 
-    // ── tool line ──
-    let tool_line = match (&ctx.active_tool, &ctx.active_tool_target) {
-        (Some(name), Some(target)) if !target.is_empty() => Line::from(vec![
-            pill(" TOOL ", Color::Yellow, Color::Black),
-            Span::raw(" "),
-            Span::styled(
-                name.clone(),
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(" · ", Style::default().fg(Color::DarkGray)),
-            Span::styled(one_line(target), Style::default().fg(Color::White)),
-        ]),
-        (Some(name), _) => Line::from(vec![
-            pill(" TOOL ", Color::Yellow, Color::Black),
-            Span::raw(" "),
-            Span::styled(
-                name.clone(),
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]),
-        (None, _) => Line::from(vec![
-            pill(" TOOL ", Color::DarkGray, Color::White),
-            Span::raw(" "),
-            Span::styled(
-                "idle",
-                Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::ITALIC),
-            ),
-        ]),
-    };
-
-    // ── about line ──
-    let topic_value = one_line(ctx.topic.as_deref().unwrap_or("(waiting for first prompt)"));
-    let about_line = Line::from(vec![
-        pill("ABOUT ", Color::LightMagenta, Color::Black),
+    let pwd_line = Line::from(vec![
+        pill(" PWD ", Color::LightMagenta, Color::Black),
         Span::raw(" "),
-        Span::styled(topic_value, Style::default().fg(Color::White)),
+        Span::styled(cwd_display, Style::default().fg(Color::White)),
     ]);
 
-    // ── trail line ──
-    let trail_spans = build_trail_spans(ctx);
-
-    // ── you line ──
     let you_line = Line::from(vec![
-        pill("  YOU ", Color::Cyan, Color::Black),
+        pill(" YOU ", Color::Cyan, Color::Black),
         Span::raw(" "),
         Span::styled(
             one_line(ctx.last_user.as_deref().unwrap_or("(waiting)")),
@@ -385,16 +327,11 @@ fn render_claude_panel(f: &mut Frame, ctx: &crate::claude::ClaudeContext, area: 
         ),
     ]);
 
-    f.render_widget(Paragraph::new(tool_line), chunks[0]);
+    f.render_widget(Paragraph::new(pwd_line), chunks[0]);
     f.render_widget(
-        Paragraph::new(about_line).wrap(Wrap { trim: false }),
-        chunks[1],
-    );
-    f.render_widget(
-        Paragraph::new(Line::from(trail_spans)).wrap(Wrap { trim: false }),
+        Paragraph::new(you_line).wrap(Wrap { trim: false }),
         chunks[2],
     );
-    f.render_widget(Paragraph::new(you_line), chunks[3]);
 }
 
 fn render_ssh_panel(f: &mut Frame, pane: &Pane, ssh: &crate::ssh::SshContext, area: Rect) {
@@ -1070,46 +1007,6 @@ fn pill(label: &str, bg: Color, fg: Color) -> Span<'static> {
             .fg(fg)
             .add_modifier(Modifier::BOLD),
     )
-}
-
-fn build_trail_spans(ctx: &crate::claude::ClaudeContext) -> Vec<Span<'static>> {
-    let mut spans: Vec<Span<'static>> = Vec::with_capacity(ctx.recent_tools.len() * 4 + 2);
-    spans.push(pill("TRAIL ", Color::Green, Color::Black));
-    spans.push(Span::raw(" "));
-
-    if ctx.recent_tools.is_empty() {
-        spans.push(Span::styled(
-            "(no tools yet)",
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::ITALIC),
-        ));
-        return spans;
-    }
-
-    let mut first = true;
-    for (name, target) in ctx.recent_tools.iter() {
-        if !first {
-            spans.push(Span::styled(" → ", Style::default().fg(Color::DarkGray)));
-        }
-        first = false;
-        spans.push(Span::styled(
-            name.clone(),
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD),
-        ));
-        if let Some(t) = target {
-            if !t.is_empty() {
-                spans.push(Span::styled(" ", Style::default()));
-                spans.push(Span::styled(
-                    one_line(t),
-                    Style::default().fg(Color::White),
-                ));
-            }
-        }
-    }
-    spans
 }
 
 fn one_line(s: &str) -> String {

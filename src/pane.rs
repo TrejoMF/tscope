@@ -220,27 +220,29 @@ impl Pane {
     }
 
     fn sync_claude(&mut self) {
-        let is_claude = self
-            .proc_info
-            .as_ref()
-            .map(|p| p.is_claude_code())
-            .unwrap_or(false);
-        if !is_claude {
-            self.claude = None;
-            return;
-        }
-        let Some(cwd) = self.proc_info.as_ref().and_then(|p| p.cwd.clone()) else {
+        let Some(info) = self.proc_info.as_ref().filter(|p| p.is_claude_code()) else {
             self.claude = None;
             return;
         };
+        let Some(cwd) = info.cwd.clone() else {
+            self.claude = None;
+            return;
+        };
+        let started_at = info.start_time;
+        // Keep the cached context only if it's the *same* claude invocation.
+        // Matching on cwd alone means a second `claude` run in the same
+        // directory keeps tailing the first session's JSONL — which is the
+        // stale-data bug this check exists to prevent.
         if let Some(ctx) = &self.claude {
-            if ctx.session_cwd == cwd {
+            if ctx.session_cwd == cwd && ctx.session_started_at == started_at {
                 return;
             }
         }
         let Some(home) = dirs::home_dir() else { return };
-        if let Some(path) = claude::find_session(&home, &cwd) {
-            self.claude = Some(ClaudeContext::new(path, cwd));
+        if let Some(path) = claude::find_session(&home, &cwd, started_at) {
+            self.claude = Some(ClaudeContext::new(path, cwd, started_at));
+        } else {
+            self.claude = None;
         }
     }
 
