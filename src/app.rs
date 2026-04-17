@@ -10,6 +10,7 @@ use std::time::Duration;
 use tokio::time::interval;
 
 use crate::config::{Config, PaneSettings};
+use crate::docker;
 use crate::pane::Pane;
 use crate::theme;
 use crate::ui;
@@ -33,6 +34,11 @@ pub enum InputMode {
     /// Modal list of all panes; pick one to become the primary (leftmost)
     /// of the visible 3-slot window.
     PanePicker(PanePickerState),
+    /// Modal listing all Docker containers (`docker ps -a`).
+    Docker(DockerState),
+    /// Read-only modal listing every keybinding. `scroll` is the row offset
+    /// from the top of the content.
+    Help { scroll: u16 },
 }
 
 #[derive(Debug)]
@@ -41,6 +47,12 @@ pub struct PanePickerState {
     /// `Some(buffer)` while the user is renaming the pane at `cursor`;
     /// `None` during normal navigation.
     pub editing: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct DockerState {
+    pub containers: Vec<docker::DockerContainer>,
+    pub cursor: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -176,7 +188,7 @@ impl App {
         let pane = self.panes.get(self.focus);
         let has_context = pane
             .map(|p| {
-                let base = p.claude.is_some() || p.ssh.is_some();
+                let base = p.claude.is_some() || p.ssh.is_some() || p.docker.is_some();
                 #[cfg(target_os = "macos")]
                 let base = base || p.service.is_some();
                 base
@@ -310,6 +322,18 @@ impl App {
         self.mode = InputMode::PanePicker(PanePickerState {
             cursor: self.focus,
             editing: None,
+        });
+    }
+
+    pub fn open_help(&mut self) {
+        self.mode = InputMode::Help { scroll: 0 };
+    }
+
+    pub fn open_docker_modal(&mut self) {
+        let containers = docker::list_containers();
+        self.mode = InputMode::Docker(DockerState {
+            containers,
+            cursor: 0,
         });
     }
 
@@ -567,9 +591,32 @@ fn handle_event(app: &mut App, ev: Event) -> Result<()> {
     match ev {
         Event::Key(key) => handle_key(app, key)?,
         Event::Mouse(me) => handle_mouse(app, me)?,
+        Event::Paste(text) => handle_paste(app, text)?,
         Event::Resize(w, h) => {
             app.screen = (w, h);
             app.relayout()?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn handle_paste(app: &mut App, text: String) -> Result<()> {
+    match &mut app.mode {
+        InputMode::Normal => {
+            if let Some(pane) = app.panes.get_mut(app.focus) {
+                pane.send_paste(&text)?;
+            }
+        }
+        InputMode::Rename { buffer } => {
+            // Single-line prompt: collapse newlines to spaces.
+            for ch in text.chars() {
+                if ch == '\n' || ch == '\r' {
+                    buffer.push(' ');
+                } else if !ch.is_control() {
+                    buffer.push(ch);
+                }
+            }
         }
         _ => {}
     }
@@ -676,6 +723,18 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
         return Ok(());
     }
 
+    // Docker modal.
+    if matches!(app.mode, InputMode::Docker(_)) {
+        handle_docker_key(app, key)?;
+        return Ok(());
+    }
+
+    // Help modal: read-only, scrollable, closes on Esc/q.
+    if matches!(app.mode, InputMode::Help { .. }) {
+        handle_help_key(app, key);
+        return Ok(());
+    }
+
     // Copy mode: keyboard-driven selection and yank.
     if matches!(app.mode, InputMode::Copy(_)) {
         handle_copy_key(app, key)?;
@@ -722,6 +781,8 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
             KeyCode::Char('r') => app.start_rename(),
             KeyCode::Char('s') => app.open_settings(),
             KeyCode::Char('p') => app.open_pane_picker(),
+            KeyCode::Char('d') => app.open_docker_modal(),
+            KeyCode::Char('i') => app.open_help(),
             KeyCode::Char('[') => app.enter_copy_mode(),
             KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
                 let n = (c as u8 - b'1') as usize;
@@ -1042,6 +1103,82 @@ fn handle_pane_picker_key(app: &mut App, key: KeyEvent) -> Result<()> {
             if idx < n {
                 app.mode = InputMode::Normal;
                 app.apply_pane_picker(idx)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn handle_help_key(app: &mut App, key: KeyEvent) {
+    // Visible rows = the modal's inner height (screen height minus borders +
+    // padding, minus the status line at the bottom). Mirrors the sizing
+    // logic in `render_help_modal`.
+    let content_rows = crate::ui::help_content_rows();
+    let max_modal_height = app.screen.1.saturating_sub(2);
+    let modal_height = (content_rows + 4).min(max_modal_height).max(6);
+    let visible_rows = modal_height.saturating_sub(4);
+    let max_scroll = content_rows.saturating_sub(visible_rows);
+
+    let InputMode::Help { scroll } = &mut app.mode else {
+        return;
+    };
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => {
+            app.mode = InputMode::Normal;
+        }
+        KeyCode::Char('j') | KeyCode::Down => {
+            *scroll = scroll.saturating_add(1).min(max_scroll);
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            *scroll = scroll.saturating_sub(1);
+        }
+        KeyCode::PageDown => {
+            *scroll = scroll.saturating_add(visible_rows.max(1)).min(max_scroll);
+        }
+        KeyCode::PageUp => {
+            *scroll = scroll.saturating_sub(visible_rows.max(1));
+        }
+        KeyCode::Home | KeyCode::Char('g') => {
+            *scroll = 0;
+        }
+        KeyCode::End | KeyCode::Char('G') => {
+            *scroll = max_scroll;
+        }
+        _ => {}
+    }
+}
+
+fn handle_docker_key(app: &mut App, key: KeyEvent) -> Result<()> {
+    let n = match &app.mode {
+        InputMode::Docker(s) => s.containers.len(),
+        _ => return Ok(()),
+    };
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.mode = InputMode::Normal;
+        }
+        KeyCode::Char('j') | KeyCode::Down => {
+            if let InputMode::Docker(s) = &mut app.mode {
+                if n > 0 {
+                    s.cursor = (s.cursor + 1) % n;
+                }
+            }
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            if let InputMode::Docker(s) = &mut app.mode {
+                if n > 0 {
+                    s.cursor = if s.cursor == 0 { n - 1 } else { s.cursor - 1 };
+                }
+            }
+        }
+        // Refresh the container list.
+        KeyCode::Char('r') | KeyCode::Char('R') => {
+            if let InputMode::Docker(s) = &mut app.mode {
+                s.containers = docker::list_containers();
+                if s.cursor >= s.containers.len() {
+                    s.cursor = s.containers.len().saturating_sub(1);
+                }
             }
         }
         _ => {}
