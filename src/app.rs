@@ -584,9 +584,32 @@ fn handle_event(app: &mut App, ev: Event) -> Result<()> {
     match ev {
         Event::Key(key) => handle_key(app, key)?,
         Event::Mouse(me) => handle_mouse(app, me)?,
+        Event::Paste(text) => handle_paste(app, text)?,
         Event::Resize(w, h) => {
             app.screen = (w, h);
             app.relayout()?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn handle_paste(app: &mut App, text: String) -> Result<()> {
+    match &mut app.mode {
+        InputMode::Normal => {
+            if let Some(pane) = app.panes.get_mut(app.focus) {
+                pane.send_paste(&text)?;
+            }
+        }
+        InputMode::Rename { buffer } => {
+            // Single-line prompt: collapse newlines to spaces.
+            for ch in text.chars() {
+                if ch == '\n' || ch == '\r' {
+                    buffer.push(' ');
+                } else if !ch.is_control() {
+                    buffer.push(ch);
+                }
+            }
         }
         _ => {}
     }

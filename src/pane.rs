@@ -299,6 +299,22 @@ impl Pane {
         Ok(())
     }
 
+    /// Forward a bracketed-paste payload to the PTY. Wrapping in
+    /// `\x1b[200~`…`\x1b[201~` lets the inner program (shell, vim, …)
+    /// recognize it as a paste so newlines don't execute mid-stream and
+    /// editors don't auto-indent each line.
+    pub fn send_paste(&mut self, text: &str) -> Result<()> {
+        // Strip the bracketed-paste sentinels if they somehow appear in the
+        // payload — otherwise a malicious or sloppy clipboard could end the
+        // paste early and inject commands.
+        let cleaned = text.replace("\x1b[200~", "").replace("\x1b[201~", "");
+        self.writer.write_all(b"\x1b[200~")?;
+        self.writer.write_all(cleaned.as_bytes())?;
+        self.writer.write_all(b"\x1b[201~")?;
+        self.writer.flush()?;
+        Ok(())
+    }
+
     /// Update `typing_buffer` / `last_typed` to surface the last line the
     /// user submitted. Best-effort: full-screen TUIs (vim, htop) will pollute
     /// the buffer with navigation keystrokes, but for shell-like sessions
