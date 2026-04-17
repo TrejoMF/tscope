@@ -43,6 +43,18 @@ impl ProcessInfo {
         false
     }
 
+    pub fn is_docker(&self) -> bool {
+        if self.name == "docker" || self.name == "docker-compose" {
+            return true;
+        }
+        if let Some(ref p) = self.exe_path {
+            if p.ends_with("/docker") || p.ends_with("/docker-compose") {
+                return true;
+            }
+        }
+        false
+    }
+
     /// User-facing command name; collapses node-wrapped claude invocations.
     pub fn display_name(&self) -> &str {
         if self.is_claude_code() {

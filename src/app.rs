@@ -10,6 +10,7 @@ use std::time::Duration;
 use tokio::time::interval;
 
 use crate::config::{Config, PaneSettings};
+use crate::docker;
 use crate::pane::Pane;
 use crate::theme;
 use crate::ui;
@@ -33,6 +34,8 @@ pub enum InputMode {
     /// Modal list of all panes; pick one to become the primary (leftmost)
     /// of the visible 3-slot window.
     PanePicker(PanePickerState),
+    /// Modal listing all Docker containers (`docker ps -a`).
+    Docker(DockerState),
 }
 
 #[derive(Debug)]
@@ -41,6 +44,12 @@ pub struct PanePickerState {
     /// `Some(buffer)` while the user is renaming the pane at `cursor`;
     /// `None` during normal navigation.
     pub editing: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct DockerState {
+    pub containers: Vec<docker::DockerContainer>,
+    pub cursor: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -176,7 +185,7 @@ impl App {
         let pane = self.panes.get(self.focus);
         let has_context = pane
             .map(|p| {
-                let base = p.claude.is_some() || p.ssh.is_some();
+                let base = p.claude.is_some() || p.ssh.is_some() || p.docker.is_some();
                 #[cfg(target_os = "macos")]
                 let base = base || p.service.is_some();
                 base
@@ -310,6 +319,14 @@ impl App {
         self.mode = InputMode::PanePicker(PanePickerState {
             cursor: self.focus,
             editing: None,
+        });
+    }
+
+    pub fn open_docker_modal(&mut self) {
+        let containers = docker::list_containers();
+        self.mode = InputMode::Docker(DockerState {
+            containers,
+            cursor: 0,
         });
     }
 
@@ -676,6 +693,12 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
         return Ok(());
     }
 
+    // Docker modal.
+    if matches!(app.mode, InputMode::Docker(_)) {
+        handle_docker_key(app, key)?;
+        return Ok(());
+    }
+
     // Copy mode: keyboard-driven selection and yank.
     if matches!(app.mode, InputMode::Copy(_)) {
         handle_copy_key(app, key)?;
@@ -722,6 +745,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
             KeyCode::Char('r') => app.start_rename(),
             KeyCode::Char('s') => app.open_settings(),
             KeyCode::Char('p') => app.open_pane_picker(),
+            KeyCode::Char('d') => app.open_docker_modal(),
             KeyCode::Char('[') => app.enter_copy_mode(),
             KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
                 let n = (c as u8 - b'1') as usize;
@@ -1042,6 +1066,43 @@ fn handle_pane_picker_key(app: &mut App, key: KeyEvent) -> Result<()> {
             if idx < n {
                 app.mode = InputMode::Normal;
                 app.apply_pane_picker(idx)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn handle_docker_key(app: &mut App, key: KeyEvent) -> Result<()> {
+    let n = match &app.mode {
+        InputMode::Docker(s) => s.containers.len(),
+        _ => return Ok(()),
+    };
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.mode = InputMode::Normal;
+        }
+        KeyCode::Char('j') | KeyCode::Down => {
+            if let InputMode::Docker(s) = &mut app.mode {
+                if n > 0 {
+                    s.cursor = (s.cursor + 1) % n;
+                }
+            }
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            if let InputMode::Docker(s) = &mut app.mode {
+                if n > 0 {
+                    s.cursor = if s.cursor == 0 { n - 1 } else { s.cursor - 1 };
+                }
+            }
+        }
+        // Refresh the container list.
+        KeyCode::Char('r') | KeyCode::Char('R') => {
+            if let InputMode::Docker(s) = &mut app.mode {
+                s.containers = docker::list_containers();
+                if s.cursor >= s.containers.len() {
+                    s.cursor = s.containers.len().saturating_sub(1);
+                }
             }
         }
         _ => {}

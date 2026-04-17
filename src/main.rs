@@ -1,6 +1,7 @@
 mod app;
 mod claude;
 mod config;
+mod docker;
 mod pane;
 mod process;
 #[cfg(target_os = "macos")]

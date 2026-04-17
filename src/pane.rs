@@ -17,6 +17,7 @@ use std::path::PathBuf;
 
 use crate::claude::{self, ClaudeContext};
 use crate::config::{Config, PaneSettings};
+use crate::docker::DockerContext;
 use crate::process::{self, ProcessInfo};
 #[cfg(target_os = "macos")]
 use crate::service::{self, ServiceContext};
@@ -44,6 +45,7 @@ pub struct Pane {
     last_poll: Instant,
     pub claude: Option<ClaudeContext>,
     pub ssh: Option<SshContext>,
+    pub docker: Option<DockerContext>,
     #[cfg(target_os = "macos")]
     pub service: Option<ServiceContext>,
     #[cfg(target_os = "macos")]
@@ -121,6 +123,7 @@ impl Pane {
                 .unwrap_or_else(Instant::now),
             claude: None,
             ssh: None,
+            docker: None,
             #[cfg(target_os = "macos")]
             service: None,
             #[cfg(target_os = "macos")]
@@ -147,14 +150,32 @@ impl Pane {
         }
         self.sync_claude();
         self.sync_ssh(config);
+        self.sync_docker();
         #[cfg(target_os = "macos")]
         self.sync_service();
     }
 
+    fn sync_docker(&mut self) {
+        let info = match &self.proc_info {
+            Some(i) if i.is_docker() => i,
+            _ => {
+                self.docker = None;
+                return;
+            }
+        };
+        // Keep existing context if same process (same start_time).
+        if let Some(existing) = &self.docker {
+            if existing.started_at == info.start_time.unwrap_or(existing.started_at) {
+                return;
+            }
+        }
+        self.docker = DockerContext::try_from_proc(info);
+    }
+
     #[cfg(target_os = "macos")]
     fn sync_service(&mut self) {
-        // Claude / SSH panes own the panel when present; skip service detection.
-        if self.claude.is_some() || self.ssh.is_some() {
+        // Claude / SSH / Docker panes own the panel when present; skip service detection.
+        if self.claude.is_some() || self.ssh.is_some() || self.docker.is_some() {
             self.service = None;
             return;
         }
