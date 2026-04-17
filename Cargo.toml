@@ -1,6 +1,6 @@
 [package]
 name = "tscope"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "A terminal multiplexer with context-aware side panels for SSH, Claude Code, and service processes."
 license = "MIT"
