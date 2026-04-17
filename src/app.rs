@@ -36,6 +36,9 @@ pub enum InputMode {
     PanePicker(PanePickerState),
     /// Modal listing all Docker containers (`docker ps -a`).
     Docker(DockerState),
+    /// Read-only modal listing every keybinding. `scroll` is the row offset
+    /// from the top of the content.
+    Help { scroll: u16 },
 }
 
 #[derive(Debug)]
@@ -320,6 +323,10 @@ impl App {
             cursor: self.focus,
             editing: None,
         });
+    }
+
+    pub fn open_help(&mut self) {
+        self.mode = InputMode::Help { scroll: 0 };
     }
 
     pub fn open_docker_modal(&mut self) {
@@ -722,6 +729,12 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
         return Ok(());
     }
 
+    // Help modal: read-only, scrollable, closes on Esc/q.
+    if matches!(app.mode, InputMode::Help { .. }) {
+        handle_help_key(app, key);
+        return Ok(());
+    }
+
     // Copy mode: keyboard-driven selection and yank.
     if matches!(app.mode, InputMode::Copy(_)) {
         handle_copy_key(app, key)?;
@@ -769,6 +782,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
             KeyCode::Char('s') => app.open_settings(),
             KeyCode::Char('p') => app.open_pane_picker(),
             KeyCode::Char('d') => app.open_docker_modal(),
+            KeyCode::Char('i') => app.open_help(),
             KeyCode::Char('[') => app.enter_copy_mode(),
             KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
                 let n = (c as u8 - b'1') as usize;
@@ -1094,6 +1108,45 @@ fn handle_pane_picker_key(app: &mut App, key: KeyEvent) -> Result<()> {
         _ => {}
     }
     Ok(())
+}
+
+fn handle_help_key(app: &mut App, key: KeyEvent) {
+    // Visible rows = the modal's inner height (screen height minus borders +
+    // padding, minus the status line at the bottom). Mirrors the sizing
+    // logic in `render_help_modal`.
+    let content_rows = crate::ui::help_content_rows();
+    let max_modal_height = app.screen.1.saturating_sub(2);
+    let modal_height = (content_rows + 4).min(max_modal_height).max(6);
+    let visible_rows = modal_height.saturating_sub(4);
+    let max_scroll = content_rows.saturating_sub(visible_rows);
+
+    let InputMode::Help { scroll } = &mut app.mode else {
+        return;
+    };
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => {
+            app.mode = InputMode::Normal;
+        }
+        KeyCode::Char('j') | KeyCode::Down => {
+            *scroll = scroll.saturating_add(1).min(max_scroll);
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            *scroll = scroll.saturating_sub(1);
+        }
+        KeyCode::PageDown => {
+            *scroll = scroll.saturating_add(visible_rows.max(1)).min(max_scroll);
+        }
+        KeyCode::PageUp => {
+            *scroll = scroll.saturating_sub(visible_rows.max(1));
+        }
+        KeyCode::Home | KeyCode::Char('g') => {
+            *scroll = 0;
+        }
+        KeyCode::End | KeyCode::Char('G') => {
+            *scroll = max_scroll;
+        }
+        _ => {}
+    }
 }
 
 fn handle_docker_key(app: &mut App, key: KeyEvent) -> Result<()> {

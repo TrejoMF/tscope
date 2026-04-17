@@ -52,6 +52,7 @@ impl SshContext {
         self.resolved_ip.lock().ok()?.clone()
     }
 
+    #[allow(dead_code)] // panel dropped uptime for now; kept for when it returns
     pub fn connection_age(&self) -> Duration {
         SystemTime::now()
             .duration_since(self.started_at)

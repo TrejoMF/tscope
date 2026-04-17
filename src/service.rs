@@ -9,6 +9,7 @@ pub struct ServiceContext {
     pub name: String,
     pub command: String,
     pub ports: Vec<u16>,
+    #[allow(dead_code)] // surfaced via uptime() when re-enabled in the panel
     pub started_at: SystemTime,
     pub rss_bytes: u64,
     pub virtual_bytes: u64,
@@ -67,6 +68,7 @@ impl ServiceContext {
         self.last_sample = Some(CpuSample { at: now, cpu_nsecs });
     }
 
+    #[allow(dead_code)] // panel dropped uptime for now; kept for when it returns
     pub fn uptime(&self) -> Duration {
         SystemTime::now()
             .duration_since(self.started_at)

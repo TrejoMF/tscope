@@ -90,6 +90,10 @@ pub fn draw(f: &mut Frame, app: &App) {
     if let InputMode::PanePicker(state) = &app.mode {
         render_pane_picker_modal(f, app, state, area);
     }
+    if let InputMode::Help { scroll } = &app.mode {
+        render_help_modal(f, area, *scroll);
+    }
+
     if let InputMode::Docker(state) = &app.mode {
         render_docker_modal(f, state, area);
     }
@@ -133,27 +137,22 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
         InputMode::Copy(_) => "COPY",
         InputMode::PanePicker(_) => "PANES",
         InputMode::Docker(_) => "DOCKER",
+        InputMode::Help { .. } => "HELP",
     };
     let help_owned = match &app.mode {
-        InputMode::Prefix => {
-            "n=new x=close h/l=switch 1-9=jump p=panes d=docker r=rename-ssh s=settings [=copy q=quit a=literal"
-                .to_string()
-        }
         InputMode::Copy(state) => {
             if let Some(msg) = &state.notice {
-                format!("{}  ·  hjkl=move v=select y=yank Esc=quit", msg)
+                format!("{}  ·  Esc=exit", msg)
             } else {
-                "hjkl/arrows=move 0/$=line g/G=top/bot v=select y/Enter=yank Esc=exit".to_string()
+                "hjkl=move  v=select  y=yank  Esc=exit".to_string()
             }
         }
-        InputMode::PanePicker(_) => {
-            "↑/↓=move 1-9=quick-select Enter=show Esc=cancel".to_string()
-        }
-        InputMode::Docker(_) => {
-            "↑/↓=move R=refresh Esc=close".to_string()
-        }
-        _ => "Ctrl-a: n=new x=close h/l=switch 1-9=jump p=panes d=docker r=rename-ssh s=settings [=copy q=quit"
-            .to_string(),
+        InputMode::Rename { .. } => "Enter=save  Esc=cancel".to_string(),
+        InputMode::Settings(_) => "Tab=field  ←/→=color  Enter=save  Esc=cancel".to_string(),
+        InputMode::PanePicker(_) => "↑/↓=move  Enter=show  Esc=cancel".to_string(),
+        InputMode::Docker(_) => "↑/↓=move  R=refresh  Esc=close".to_string(),
+        InputMode::Help { .. } => "j/k=scroll  Esc=close".to_string(),
+        _ => "Ctrl-a i  help".to_string(),
     };
     let style = if matches!(app.mode, InputMode::Copy(_)) {
         Style::default().bg(Color::Rgb(0x44, 0x3a, 0x78)).fg(Color::White)
@@ -301,28 +300,104 @@ fn render_context_panel(f: &mut Frame, app: &App, area: Rect) {
     let Some(pane) = app.panes.get(app.focus) else {
         return;
     };
+    let header = build_panel_header(pane);
+
     if let Some(ctx) = pane.claude.as_ref() {
-        render_claude_panel(f, ctx, area);
+        render_claude_panel(f, ctx, &header, area);
         return;
     }
     if let Some(ssh) = pane.ssh.as_ref() {
-        render_ssh_panel(f, pane, ssh, area);
+        render_ssh_panel(f, pane, ssh, &header, area);
         return;
     }
     if let Some(docker) = pane.docker.as_ref() {
-        render_docker_panel(f, pane, docker, area);
+        render_docker_panel(f, pane, docker, &header, area);
         return;
     }
     #[cfg(target_os = "macos")]
     if let Some(svc) = pane.service.as_ref() {
-        render_service_panel(f, svc, area);
+        render_service_panel(f, svc, &header, area);
     }
 }
 
-fn render_claude_panel(f: &mut Frame, ctx: &crate::claude::ClaudeContext, area: Rect) {
-    let cwd_display = shorten_home(&ctx.session_cwd);
+/// Shared chips appended to every panel's title line: path, git branch, and
+/// foreground-process uptime. Computed once per frame and passed to each
+/// type-specific renderer.
+struct PanelHeader {
+    cwd_display: Option<String>,
+    branch: Option<String>,
+    uptime: Option<std::time::Duration>,
+}
 
-    let title_line = Line::from(vec![
+fn build_panel_header(pane: &Pane) -> PanelHeader {
+    let cwd_path = pane
+        .proc_info
+        .as_ref()
+        .and_then(|p| p.cwd.clone())
+        .or_else(|| pane.initial_cwd.clone());
+    let branch = cwd_path.as_deref().and_then(crate::env_info::git_branch);
+    let cwd_display = cwd_path.as_deref().map(shorten_home);
+    let uptime = pane
+        .proc_info
+        .as_ref()
+        .and_then(|p| p.start_time)
+        .and_then(|t| std::time::SystemTime::now().duration_since(t).ok());
+    PanelHeader {
+        cwd_display,
+        branch,
+        uptime,
+    }
+}
+
+/// Unified accent color for the shared header chips — a pink-red that sits
+/// between DeepPink and Salmon. Applied to icons, text, and separators so the
+/// right-hand title reads as a single cohesive block regardless of panel type.
+const HEADER_CHIP_COLOR: Color = Color::Rgb(0xff, 0x5f, 0x87);
+
+/// Build the right-aligned title line showing `📁 path · 🌿 branch · ⏱ uptime`.
+/// Returns `None` when the pane has no data to show, so the caller can skip
+/// adding an empty title.
+fn header_title(header: &PanelHeader) -> Option<Line<'static>> {
+    let accent = Style::default().fg(HEADER_CHIP_COLOR);
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let push_sep = |s: &mut Vec<Span<'static>>| {
+        if !s.is_empty() {
+            s.push(Span::styled(" · ", accent));
+        }
+    };
+
+    if let Some(cwd) = &header.cwd_display {
+        push_sep(&mut spans);
+        spans.push(Span::styled(format!("📁 {}", cwd), accent));
+    }
+    if let Some(branch) = &header.branch {
+        push_sep(&mut spans);
+        spans.push(Span::styled(format!("🌿 {}", branch), accent));
+    }
+    if let Some(uptime) = header.uptime {
+        push_sep(&mut spans);
+        spans.push(Span::styled(
+            format!("⏱ {}", crate::ssh::format_duration(uptime)),
+            accent,
+        ));
+    }
+
+    if spans.is_empty() {
+        return None;
+    }
+    // Pad on both sides so the chips don't kiss the border corners.
+    spans.insert(0, Span::raw(" "));
+    spans.push(Span::raw(" "));
+    Some(Line::from(spans).right_aligned())
+}
+
+fn render_claude_panel(
+    f: &mut Frame,
+    ctx: &crate::claude::ClaudeContext,
+    header: &PanelHeader,
+    area: Rect,
+) {
+    let title_spans: Vec<Span<'static>> = vec![
         Span::raw(" "),
         Span::styled(
             "⚡ claude",
@@ -331,31 +406,27 @@ fn render_claude_panel(f: &mut Frame, ctx: &crate::claude::ClaudeContext, area: 
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw(" "),
-    ]);
+    ];
 
-    let block = Block::default()
+    let mut block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(Color::Magenta))
-        .title(title_line)
+        .title(Line::from(title_spans))
         .title_alignment(Alignment::Left)
         .padding(Padding::horizontal(1));
+    if let Some(h) = header_title(header) {
+        block = block.title_top(h);
+    }
 
     let inner = block.inner(area);
     f.render_widget(block, area);
 
     let chunks = Layout::vertical([
-        Constraint::Length(1), // pwd
         Constraint::Length(1), // spacer
         Constraint::Min(1),    // you (wraps)
     ])
     .split(inner);
-
-    let pwd_line = Line::from(vec![
-        pill(" PWD ", Color::LightMagenta, Color::Black),
-        Span::raw(" "),
-        Span::styled(cwd_display, Style::default().fg(Color::White)),
-    ]);
 
     let you_line = Line::from(vec![
         pill(" YOU ", Color::Cyan, Color::Black),
@@ -368,14 +439,19 @@ fn render_claude_panel(f: &mut Frame, ctx: &crate::claude::ClaudeContext, area: 
         ),
     ]);
 
-    f.render_widget(Paragraph::new(pwd_line), chunks[0]);
     f.render_widget(
         Paragraph::new(you_line).wrap(Wrap { trim: false }),
-        chunks[2],
+        chunks[1],
     );
 }
 
-fn render_ssh_panel(f: &mut Frame, pane: &Pane, ssh: &crate::ssh::SshContext, area: Rect) {
+fn render_ssh_panel(
+    f: &mut Frame,
+    pane: &Pane,
+    ssh: &crate::ssh::SshContext,
+    header: &PanelHeader,
+    area: Rect,
+) {
     let who = match (&ssh.user, &ssh.host) {
         (Some(u), h) => format!("{}@{}", u, h),
         (None, h) => h.clone(),
@@ -383,7 +459,6 @@ fn render_ssh_panel(f: &mut Frame, pane: &Pane, ssh: &crate::ssh::SshContext, ar
     let display = ssh.display_name.clone().unwrap_or_else(|| who.clone());
     let ip = ssh.resolved_ip();
     let port_str = ssh.port.map(|p| p.to_string());
-    let age = crate::ssh::format_duration(ssh.connection_age());
 
     // --- bordered block with title ------------------------------------------
     let mut title_spans: Vec<Span<'static>> = vec![
@@ -402,24 +477,12 @@ fn render_ssh_panel(f: &mut Frame, pane: &Pane, ssh: &crate::ssh::SshContext, ar
             Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
         ),
     ];
-    // If there's a custom alias AND it differs from user@host, show the real
-    // target in dim text next to it so you never lose sight of what you're on.
     if ssh.display_name.is_some() && display != who {
         title_spans.push(Span::styled(
             format!(" ({})", who),
             Style::default().fg(Color::DarkGray),
         ));
     }
-    title_spans.extend([
-        Span::raw(" "),
-        dim_sep(),
-        Span::raw(" "),
-        Span::styled("⏱ ", Style::default().fg(Color::Cyan)),
-        Span::styled(
-            format!("up {}", age),
-            Style::default().fg(Color::Cyan),
-        ),
-    ]);
     if let Some(p) = &port_str {
         title_spans.push(Span::raw(" "));
         title_spans.push(dim_sep());
@@ -431,13 +494,16 @@ fn render_ssh_panel(f: &mut Frame, pane: &Pane, ssh: &crate::ssh::SshContext, ar
     }
     title_spans.push(Span::raw(" "));
 
-    let block = Block::default()
+    let mut block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(Color::Blue))
         .title(Line::from(title_spans))
         .title_alignment(Alignment::Left)
         .padding(Padding::horizontal(1));
+    if let Some(h) = header_title(header) {
+        block = block.title_top(h);
+    }
 
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -541,10 +607,9 @@ fn render_docker_panel(
     f: &mut Frame,
     pane: &Pane,
     docker: &crate::docker::DockerContext,
+    header: &PanelHeader,
     area: Rect,
 ) {
-    let age = crate::ssh::format_duration(docker.uptime());
-
     let mut title_spans: Vec<Span<'static>> = vec![
         Span::raw(" "),
         Span::styled(
@@ -585,22 +650,18 @@ fn render_docker_panel(
                 .add_modifier(Modifier::BOLD),
         ));
     }
-    title_spans.extend([
-        Span::raw(" "),
-        dim_sep(),
-        Span::raw(" "),
-        Span::styled("⏱ ", Style::default().fg(Color::Cyan)),
-        Span::styled(format!("up {}", age), Style::default().fg(Color::Cyan)),
-        Span::raw(" "),
-    ]);
+    title_spans.push(Span::raw(" "));
 
-    let block = Block::default()
+    let mut block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(Color::LightCyan))
         .title(Line::from(title_spans))
         .title_alignment(Alignment::Left)
         .padding(Padding::horizontal(1));
+    if let Some(h) = header_title(header) {
+        block = block.title_top(h);
+    }
 
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -895,6 +956,191 @@ fn truncate_str(s: &str, max: usize) -> String {
     }
 }
 
+type HelpSection = (&'static str, &'static [(&'static str, &'static str)]);
+
+const HELP_COLUMNS: &[&[HelpSection]] = &[
+    // Left column: the prefix note plus the panes and copy-mode sections,
+    // which are the longest and most common lookups.
+    &[
+        ("Prefix: Ctrl-a, release, then command key", &[]),
+        (
+            "Panes",
+            &[
+                ("n",        "new pane"),
+                ("x",        "close focused pane"),
+                ("h / ←",    "focus previous"),
+                ("l / →",    "focus next"),
+                ("1-9",      "jump to pane N"),
+                ("p",        "pane picker (all panes)"),
+                ("r",        "rename SSH alias"),
+                ("s",        "settings (name + color)"),
+            ],
+        ),
+        (
+            "Copy mode",
+            &[
+                ("hjkl / arrows", "move cursor"),
+                ("0 / Home",      "start of line"),
+                ("$ / End",       "end of line"),
+                ("g / G",         "top / bottom"),
+                ("v / Space",     "start selection"),
+                ("y / Enter",     "yank to clipboard"),
+                ("Esc / q",       "exit"),
+            ],
+        ),
+    ],
+    // Right column: the shorter modal/mode sections.
+    &[
+        (
+            "Modes & Modals",
+            &[
+                ("[",        "enter copy mode"),
+                ("d",        "docker container list"),
+                ("i",        "this help"),
+            ],
+        ),
+        (
+            "Other",
+            &[
+                ("a",        "send literal Ctrl-a"),
+                ("q",        "quit"),
+                ("Ctrl-q",   "emergency quit (no prefix)"),
+            ],
+        ),
+        (
+            "Docker / Pane picker",
+            &[
+                ("j/k or ↑/↓",   "navigate"),
+                ("Enter",        "select (picker only)"),
+                ("R",            "refresh (docker only)"),
+                ("Esc / q",      "close"),
+            ],
+        ),
+        (
+            "Help modal",
+            &[
+                ("j/k or ↑/↓",   "scroll"),
+                ("PgUp / PgDn",  "page scroll"),
+                ("g / G",        "top / bottom"),
+                ("Esc / q",      "close"),
+            ],
+        ),
+    ],
+];
+
+fn build_help_column(sections: &[HelpSection]) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for (section, rows) in sections {
+        if !lines.is_empty() {
+            lines.push(Line::from(""));
+        }
+        lines.push(Line::from(Span::styled(
+            section.to_string(),
+            Style::default()
+                .fg(Color::LightCyan)
+                .add_modifier(Modifier::BOLD),
+        )));
+        for (keys, desc) in *rows {
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(
+                    format!("{:<16}", keys),
+                    Style::default().fg(Color::Yellow),
+                ),
+                Span::styled(desc.to_string(), Style::default().fg(Color::White)),
+            ]));
+        }
+    }
+    lines
+}
+
+/// Maximum column height — the taller of the two columns. The modal sizes
+/// itself to this and the scroll handler in `app.rs` clamps against it.
+pub fn help_content_rows() -> u16 {
+    HELP_COLUMNS
+        .iter()
+        .map(|sections| build_help_column(sections).len())
+        .max()
+        .unwrap_or(0) as u16
+}
+
+fn render_help_modal(f: &mut Frame, area: Rect, scroll: u16) {
+    let columns: Vec<Vec<Line<'static>>> = HELP_COLUMNS
+        .iter()
+        .map(|sections| build_help_column(sections))
+        .collect();
+    let content_height = columns.iter().map(|c| c.len()).max().unwrap_or(0) as u16;
+
+    // Wider than before so two columns breathe; cap at terminal width.
+    let width = 96u16.min(area.width.saturating_sub(4));
+    let max_height = area.height.saturating_sub(2);
+    let height = (content_height + 4).min(max_height).max(6);
+    let rect = center_rect(width, height, area);
+
+    f.render_widget(Clear, rect);
+
+    let visible_rows = height.saturating_sub(4);
+    let max_scroll = content_height.saturating_sub(visible_rows);
+    let clamped = scroll.min(max_scroll);
+
+    let scroll_hint = if max_scroll == 0 {
+        String::new()
+    } else {
+        let end = (clamped + visible_rows).min(content_height);
+        format!("{}-{} / {}", clamped + 1, end, content_height)
+    };
+
+    let mut title_spans = vec![
+        Span::raw(" "),
+        Span::styled(
+            "🛈 Shortcuts",
+            Style::default()
+                .fg(Color::LightCyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+        dim_sep(),
+        Span::raw(" "),
+        Span::styled(
+            "j/k=scroll  Esc=close",
+            Style::default().fg(Color::DarkGray),
+        ),
+    ];
+    if !scroll_hint.is_empty() {
+        title_spans.push(Span::raw("  "));
+        title_spans.push(dim_sep());
+        title_spans.push(Span::raw(" "));
+        title_spans.push(Span::styled(
+            scroll_hint,
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    title_spans.push(Span::raw(" "));
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::LightCyan))
+        .title(Line::from(title_spans))
+        .title_alignment(Alignment::Left)
+        .padding(Padding::new(2, 2, 1, 1));
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+
+    // Split the inner body into equal columns, one Paragraph per column,
+    // both scrolled by the same offset so keyboard scrolling stays intuitive.
+    let n = columns.len() as u16;
+    let col_constraints: Vec<Constraint> = (0..n)
+        .map(|_| Constraint::Ratio(1, n as u32))
+        .collect();
+    let col_areas = Layout::horizontal(col_constraints).split(inner);
+
+    for (col_lines, col_area) in columns.into_iter().zip(col_areas.iter()) {
+        let paragraph = Paragraph::new(col_lines).scroll((clamped, 0));
+        f.render_widget(paragraph, *col_area);
+    }
+}
+
 /// Simplify the verbose port mapping from `docker ps` (e.g.
 /// "0.0.0.0:8080->80/tcp" → ":8080→80") to save horizontal space.
 fn simplify_ports(ports: &str) -> String {
@@ -921,10 +1167,10 @@ fn simplify_ports(ports: &str) -> String {
 fn render_service_panel(
     f: &mut Frame,
     svc: &crate::service::ServiceContext,
+    header: &PanelHeader,
     area: Rect,
 ) {
     use crate::service::format_bytes;
-    let uptime = crate::ssh::format_duration(svc.uptime());
     let first_port = svc.ports.first().copied();
 
     // --- title line ---------------------------------------------------------
@@ -957,22 +1203,18 @@ fn render_service_panel(
                 .add_modifier(Modifier::BOLD),
         ));
     }
-    title_spans.extend([
-        Span::raw(" "),
-        dim_sep(),
-        Span::raw(" "),
-        Span::styled("⏱ ", Style::default().fg(Color::Cyan)),
-        Span::styled(format!("up {}", uptime), Style::default().fg(Color::Cyan)),
-        Span::raw(" "),
-    ]);
+    title_spans.push(Span::raw(" "));
 
-    let block = Block::default()
+    let mut block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(Color::LightGreen))
         .title(Line::from(title_spans))
         .title_alignment(Alignment::Left)
         .padding(Padding::horizontal(1));
+    if let Some(h) = header_title(header) {
+        block = block.title_top(h);
+    }
     let inner = block.inner(area);
     f.render_widget(block, area);
 

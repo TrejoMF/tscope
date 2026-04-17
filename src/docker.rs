@@ -29,6 +29,7 @@ impl DockerContext {
         })
     }
 
+    #[allow(dead_code)] // panel dropped uptime for now; kept for when it returns
     pub fn uptime(&self) -> std::time::Duration {
         SystemTime::now()
             .duration_since(self.started_at)

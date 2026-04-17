@@ -2,6 +2,7 @@ mod app;
 mod claude;
 mod config;
 mod docker;
+mod env_info;
 mod pane;
 mod process;
 #[cfg(target_os = "macos")]
